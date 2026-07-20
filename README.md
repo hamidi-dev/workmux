@@ -1776,7 +1776,14 @@ to show only agents in the current tmux session.
 workmux sidebar                 # Toggle sidebar on/off (all sessions)
 workmux sidebar --session       # Toggle current session only, or opt out of global mode
 workmux sidebar --position top  # Override configured placement for this toggle
+workmux sidebar layout          # Cycle content panes to the next tmux layout
+workmux sidebar layout tiled    # Apply a named tmux layout to content panes
+workmux sidebar layout previous # Cycle to the previous tmux layout
 ```
+
+The `layout` action excludes the sidebar pane, preserving its configured edge
+and size. It accepts tmux layout names and serialized layouts. Serialized
+layouts must describe the content panes only.
 
 The sidebar displays:
 
@@ -1820,9 +1827,14 @@ configured placement when enabling the sidebar.
 
 ```bash
 bind C-t run-shell "workmux sidebar"
+
+# Replace tmux's standard layout cycling bindings while preserving the sidebar.
+bind Space run-shell "workmux sidebar layout --target '#{window_id}'"
+bind M-Space run-shell "workmux sidebar layout previous --target '#{window_id}'"
 ```
 
-Then press `prefix + Ctrl-t` to toggle the sidebar.
+Then press `prefix + Ctrl-t` to toggle the sidebar. The layout bindings arrange
+the window that triggered them even if focus changes before `workmux` starts.
 
 > **Note:** The sidebar is currently tmux-only. When enabled, a sidebar pane is
 > created in every existing window, and new windows automatically get one via a

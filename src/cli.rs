@@ -805,6 +805,16 @@ pub enum SidebarAction {
         #[arg(value_name = "MODE")]
         mode: Option<String>,
     },
+    /// Apply a tmux layout to content panes while preserving the sidebar
+    Layout {
+        /// Tmux layout name, serialized layout, or next/previous
+        #[arg(value_name = "LAYOUT", default_value = "next")]
+        layout: String,
+
+        /// Target tmux window
+        #[arg(short = 't', long)]
+        target: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1072,6 +1082,9 @@ pub fn run() -> Result<()> {
             Some(SidebarAction::Filter { mode }) => {
                 command::sidebar::set_filter_mode(mode.as_deref())
             }
+            Some(SidebarAction::Layout { layout, target }) => {
+                command::sidebar::apply_layout(&layout, target.as_deref())
+            }
             None => {
                 if session {
                     command::sidebar::toggle_session(position)
@@ -1289,6 +1302,46 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidValue);
         assert!(err.to_string().contains("left"));
         assert!(err.to_string().contains("top"));
+    }
+
+    #[test]
+    fn sidebar_layout_defaults_to_next() {
+        let cli = Cli::try_parse_from(["workmux", "sidebar", "layout"]).unwrap();
+
+        match cli.command {
+            Commands::Sidebar {
+                action: Some(SidebarAction::Layout { layout, target }),
+                ..
+            } => {
+                assert_eq!(layout, "next");
+                assert_eq!(target, None);
+            }
+            _ => panic!("expected sidebar layout command"),
+        }
+    }
+
+    #[test]
+    fn sidebar_layout_parses_name_and_target() {
+        let cli = Cli::try_parse_from([
+            "workmux",
+            "sidebar",
+            "layout",
+            "even-vertical",
+            "--target",
+            "@42",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Sidebar {
+                action: Some(SidebarAction::Layout { layout, target }),
+                ..
+            } => {
+                assert_eq!(layout, "even-vertical");
+                assert_eq!(target.as_deref(), Some("@42"));
+            }
+            _ => panic!("expected sidebar layout command"),
+        }
     }
 
     #[test]

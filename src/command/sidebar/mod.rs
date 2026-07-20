@@ -23,6 +23,7 @@ mod client;
 mod daemon;
 mod daemon_ctrl;
 mod hooks;
+mod layout;
 mod layout_tree;
 mod panes;
 mod runtime;
@@ -38,7 +39,8 @@ use self::daemon_ctrl::{ensure_daemon_running, kill_daemon, signal_daemon};
 use self::hooks::{install_hooks, remove_hooks};
 use self::panes::{
     create_sidebar_in_window, create_sidebars_in_all_windows, create_sidebars_in_session,
-    find_sidebar_in_window, kill_all_sidebars_and_restore_layouts, kill_sidebars_in_session,
+    find_sidebar_in_window, find_sidebar_pane_id, kill_all_sidebars_and_restore_layouts,
+    kill_sidebars_in_session,
 };
 
 const SIDEBAR_ROLE_VALUE: &str = "sidebar";
@@ -701,23 +703,7 @@ pub fn reflow(window_id: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    // Find the sidebar pane ID in this window
-    let output = Cmd::new("tmux")
-        .args(&[
-            "list-panes",
-            "-t",
-            &target,
-            "-F",
-            "#{pane_id} #{@workmux_role}",
-        ])
-        .run_and_capture_stdout()?;
-
-    let sidebar_pane_id = output.lines().find_map(|line| {
-        let (id, role) = line.split_once(' ')?;
-        (role.trim() == SIDEBAR_ROLE_VALUE).then(|| id.to_string())
-    });
-
-    let Some(sidebar_pane_id) = sidebar_pane_id else {
+    let Some(sidebar_pane_id) = find_sidebar_pane_id(&target)? else {
         return Ok(());
     };
 
@@ -725,6 +711,11 @@ pub fn reflow(window_id: Option<&str>) -> Result<()> {
 
     layout_tree::reflow_after_sidebar_add(&target, &sidebar_pane_id, position, size);
     Ok(())
+}
+
+/// Apply a tmux layout to content panes while preserving the sidebar.
+pub fn apply_layout(layout: &str, target: Option<&str>) -> Result<()> {
+    layout::apply(layout, target)
 }
 
 /// Request a sidebar refresh if the daemon is running.

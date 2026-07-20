@@ -11,13 +11,27 @@ use super::daemon_ctrl::kill_daemon;
 use super::hooks::remove_hooks;
 use super::layout_tree::{layout_after_sidebar_remove, reflow_after_sidebar_add};
 
-/// Check if a window already has a sidebar pane.
-pub(super) fn find_sidebar_in_window(window_id: &str) -> Result<bool> {
+/// Find the sidebar pane ID in a window.
+pub(super) fn find_sidebar_pane_id(window_id: &str) -> Result<Option<String>> {
     let output = Cmd::new("tmux")
-        .args(&["list-panes", "-t", window_id, "-F", "#{@workmux_role}"])
+        .args(&[
+            "list-panes",
+            "-t",
+            window_id,
+            "-F",
+            "#{pane_id}\t#{@workmux_role}",
+        ])
         .run_and_capture_stdout()?;
 
-    Ok(output.lines().any(|l| l.trim() == SIDEBAR_ROLE_VALUE))
+    Ok(output.lines().find_map(|line| {
+        let (pane_id, role) = line.split_once('\t')?;
+        (role.trim() == SIDEBAR_ROLE_VALUE).then(|| pane_id.to_string())
+    }))
+}
+
+/// Check if a window already has a sidebar pane.
+pub(super) fn find_sidebar_in_window(window_id: &str) -> Result<bool> {
+    Ok(find_sidebar_pane_id(window_id)?.is_some())
 }
 
 /// Create a sidebar pane in a specific window (idempotent).
