@@ -119,6 +119,13 @@ def test_next_cycles_content_layout_without_leaking_windows(
     vertical = [row for row in _pane_rows(env, "test:") if row["role"] != "sidebar"]
     assert len({row["left"] for row in vertical}) == 1
     assert len({row["top"] for row in vertical}) == len(vertical)
+
+    _run_layout(env, workmux_exe_path, repo_path, "")
+    main_horizontal = [
+        row for row in _pane_rows(env, "test:") if row["role"] != "sidebar"
+    ]
+    assert len({row["left"] for row in main_horizontal}) == 2
+    assert len({row["top"] for row in main_horizontal}) == 2
     assert (
         env.tmux(["list-windows", "-F", "#{window_id}"]).stdout.splitlines()
         == windows_before
@@ -183,6 +190,19 @@ def test_invalid_layout_restores_sidebar_and_removes_temporary_window(
         env.tmux(["list-windows", "-F", "#{window_id}"]).stdout.splitlines()
         == windows_before
     )
+
+
+def test_layout_preserves_sidebar_with_one_content_pane(
+    mux_server: MuxEnvironment, workmux_exe_path: Path, repo_path: Path
+):
+    env = cast(TmuxEnvironment, mux_server)
+    sidebar_id = _add_sidebar(env, "test:")
+
+    _run_layout(env, workmux_exe_path, repo_path, "tiled")
+
+    rows = _pane_rows(env, "test:")
+    assert len(rows) == 2
+    assert next(row for row in rows if row["role"] == "sidebar")["id"] == sidebar_id
 
 
 def test_layout_delegates_when_sidebar_is_absent(

@@ -36,7 +36,7 @@ fn select_layout(window_id: &str, layout: &str) -> Result<()> {
         "next" => Cmd::new("tmux")
             .args(&["select-layout", "-n", "-t", window_id])
             .run(),
-        "previous" | "prev" => Cmd::new("tmux")
+        "previous" => Cmd::new("tmux")
             .args(&["select-layout", "-p", "-t", window_id])
             .run(),
         layout => Cmd::new("tmux")
