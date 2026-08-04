@@ -1096,6 +1096,17 @@ impl Multiplexer for TmuxBackend {
             // auto-clear work per-agent even with multiple agents in one window.
             let hook_cmd = auto_clear_status_hook(icon);
             let _ = self.tmux_cmd(&["set-hook", "-w", "-t", pane_id, "pane-focus-in", &hook_cmd]);
+
+            // A status in the focused pane is already acknowledged. Background
+            // panes retain the status until their pane-focus-in hook runs.
+            let _ = self.tmux_cmd(&[
+                "if-shell",
+                "-F",
+                "-t",
+                pane_id,
+                FOCUSED_PANE_FORMAT,
+                &hook_cmd,
+            ]);
         }
 
         Ok(())
@@ -1190,6 +1201,9 @@ impl Multiplexer for TmuxBackend {
         parse_live_pane_snapshot(&output)
     }
 }
+/// A pane is focused when it is selected in a visible, attached session.
+const FOCUSED_PANE_FORMAT: &str = "#{&&:#{pane_active},#{&&:#{window_active},#{session_attached}}}";
+
 /// Build the pane-focus hook that acknowledges a status and refreshes sidebar clients.
 fn auto_clear_status_hook(icon: &str) -> String {
     format!(
