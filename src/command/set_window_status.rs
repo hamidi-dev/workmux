@@ -75,18 +75,21 @@ impl StatusTarget {
     }
 }
 
-pub fn run(cmd: SetWindowStatusCommand) -> Result<()> {
+pub fn run(cmd: SetWindowStatusCommand, session_id: Option<String>) -> Result<()> {
     if status_tracking_disabled() {
         return Ok(());
     }
 
+    let agent_session_id = session_id
+        .filter(|id| !id.is_empty())
+        .or_else(read_hook_session_id);
+
     // Inside a sandbox guest, route through RPC to the host supervisor
     if crate::sandbox::guest::is_sandbox_guest() {
-        return run_via_rpc(cmd);
+        return run_via_rpc(cmd, agent_session_id);
     }
 
     let config = Config::load(None)?;
-    let agent_session_id = read_hook_session_id();
     run_for_status_target(agent_session_id.as_deref(), |mux, pane_id| {
         apply_status_update(&cmd, &config, mux, pane_id, agent_session_id.as_deref())
     })
@@ -380,10 +383,11 @@ fn select_pane_for_agent_session(
 }
 
 fn register_via_rpc() -> Result<()> {
-    run_status_via_rpc("register")
+    run_status_via_rpc("register", None)
 }
 
-fn run_via_rpc(cmd: SetWindowStatusCommand) -> Result<()> {
+/// Send a status update via RPC when running inside a sandbox guest.
+fn run_via_rpc(cmd: SetWindowStatusCommand, session_id: Option<String>) -> Result<()> {
     let status = match cmd {
         SetWindowStatusCommand::Working => "working",
         SetWindowStatusCommand::Waiting => "waiting",
@@ -391,15 +395,16 @@ fn run_via_rpc(cmd: SetWindowStatusCommand) -> Result<()> {
         SetWindowStatusCommand::Clear => "clear",
     };
 
-    run_status_via_rpc(status)
+    run_status_via_rpc(status, session_id)
 }
 
-fn run_status_via_rpc(status: &str) -> Result<()> {
+fn run_status_via_rpc(status: &str, session_id: Option<String>) -> Result<()> {
     use crate::sandbox::rpc::{RpcClient, RpcRequest, RpcResponse};
 
     let mut client = RpcClient::from_env()?;
     let response = client.call(&RpcRequest::SetStatus {
         status: status.to_string(),
+        session_id,
     })?;
 
     match response {

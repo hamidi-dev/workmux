@@ -15,10 +15,17 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $ }) => {
   const acceptBusyBySession = new Map<string, boolean>();
   const deletedSessions = new Set<string>();
   let reportedStatus: string | undefined;
+  // The pane's own session is the first one this client reports. Subagents are
+  // created later and must not displace the session used for pane metadata.
+  let rootSession: string | undefined;
+  let reportedSession: string | undefined;
   let statusQueue = Promise.resolve();
 
   function writeStatus(status: string) {
-    return $`workmux set-window-status ${status}`.quiet().then(() => {}, () => {});
+    const command = rootSession
+      ? $`workmux set-window-status ${status} --session-id ${rootSession}`
+      : $`workmux set-window-status ${status}`;
+    return command.quiet().then(() => {}, () => {});
   }
 
   function queueStatus(status: string) {
@@ -39,11 +46,12 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $ }) => {
       status = 'working';
     }
 
-    if (reportedStatus === status) {
+    if (reportedStatus === status && reportedSession === rootSession) {
       return;
     }
 
     reportedStatus = status;
+    reportedSession = rootSession;
     await queueStatus(status);
   }
 
@@ -54,6 +62,8 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $ }) => {
     if (!sessionID || deletedSessions.has(sessionID)) {
       return;
     }
+
+    rootSession ??= sessionID;
 
     const previous = statusBySession.get(sessionID);
     if (status === 'done' && previous === undefined) {
@@ -108,7 +118,13 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $ }) => {
           const sessionID = event.properties.info.id;
           deletedSessions.add(sessionID);
           acceptBusyBySession.delete(sessionID);
-          if (statusBySession.delete(sessionID)) {
+          const tracked = statusBySession.delete(sessionID);
+          // Losing the root session frees the slot: whatever this client works
+          // on next is the pane's session now.
+          if (rootSession === sessionID) {
+            rootSession = undefined;
+          }
+          if (tracked) {
             await reportAggregateStatus();
           }
           break;

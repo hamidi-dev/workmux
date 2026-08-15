@@ -4097,6 +4097,7 @@ mod tests {
                 window_name: None,
                 session_name: None,
                 boot_id: None,
+                agent_session_id: None,
                 agent_kind: None,
                 agent_session_id: None,
             };

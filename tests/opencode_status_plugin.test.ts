@@ -5,10 +5,10 @@ import { WorkmuxStatusPlugin } from '../resources/opencode/plugins/workmux-statu
 async function createHarness({ failRegistration = false } = {}) {
   const statuses: string[] = [];
   const commands: string[] = [];
-  const shell = (strings: TemplateStringsArray, status?: string) => {
+  const shell = (strings: TemplateStringsArray, ...values: string[]) => {
     const command = strings.reduce(
-      (result, part, index) => result + part + (index < strings.length - 1 ? status : ''),
-      '',
+      (result, part, index) => result + part + (values[index] ?? ''),
+      ''
     );
     return {
       quiet: async () => {
@@ -16,8 +16,8 @@ async function createHarness({ failRegistration = false } = {}) {
         if (command === 'workmux register-agent' && failRegistration) {
           throw new Error('registration failed');
         }
-        if (status !== undefined) {
-          statuses.push(status);
+        if (values[0] !== undefined) {
+          statuses.push(values[0]);
         }
       },
     };
@@ -71,7 +71,7 @@ describe('WorkmuxStatusPlugin', () => {
 
     expect(harness.commands).toEqual([
       'workmux register-agent',
-      'workmux set-window-status working',
+      'workmux set-window-status working --session-id parent',
     ]);
   });
 
@@ -81,7 +81,7 @@ describe('WorkmuxStatusPlugin', () => {
 
     expect(harness.commands).toEqual([
       'workmux register-agent',
-      'workmux set-window-status working',
+      'workmux set-window-status working --session-id parent',
     ]);
     expect(harness.statuses).toEqual(['working']);
   });
@@ -90,9 +90,10 @@ describe('WorkmuxStatusPlugin', () => {
     const commands: string[] = [];
     const applied: string[] = [];
     const completions: Array<() => void> = [];
-    const shell = (strings: TemplateStringsArray, status?: string) => {
+    const shell = (strings: TemplateStringsArray, ...values: string[]) => {
+      const status = values[0];
       const command = strings.reduce(
-        (result, part, index) => result + part + (index < strings.length - 1 ? status : ''),
+        (result, part, index) => result + part + (values[index] ?? ''),
         '',
       );
       return {
@@ -115,14 +116,16 @@ describe('WorkmuxStatusPlugin', () => {
     const busy = hooks.event?.({ event: sessionStatus('parent', 'busy') } as never);
     const idle = hooks.event?.({ event: sessionStatus('parent', 'idle') } as never);
     await Promise.resolve();
-    expect(commands).toEqual(['workmux set-window-status working']);
+    expect(commands).toEqual([
+      'workmux set-window-status working --session-id parent',
+    ]);
 
     completions.shift()?.();
     await busy;
     await Promise.resolve();
     expect(commands).toEqual([
-      'workmux set-window-status working',
-      'workmux set-window-status done',
+      'workmux set-window-status working --session-id parent',
+      'workmux set-window-status done --session-id parent',
     ]);
     expect(applied).toEqual(['working']);
 
@@ -202,6 +205,37 @@ describe('WorkmuxStatusPlugin', () => {
     await harness.emit(userMessage('parent'));
     await harness.emit(sessionStatus('parent', 'busy'));
     expect(harness.statuses).toEqual(['working', 'done', 'working']);
+  });
+
+  test('reports the root session id and never a subagent one', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionStatus('parent', 'busy'));
+    await harness.emit(sessionStatus('child', 'busy'));
+    await harness.emit(sessionStatus('child', 'idle'));
+    await harness.emit(sessionStatus('parent', 'idle'));
+
+    expect(harness.commands).toEqual([
+      'workmux register-agent',
+      'workmux set-window-status working --session-id parent',
+      'workmux set-window-status done --session-id parent',
+    ]);
+  });
+
+  test('adopts a new root session after the old one is deleted', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionStatus('first', 'busy'));
+    await harness.emit(sessionStatus('first', 'idle'));
+    await harness.emit({
+      type: 'session.deleted',
+      properties: { info: { id: 'first' } },
+    });
+    await harness.emit(sessionStatus('second', 'busy'));
+
+    expect(harness.commands.at(-1)).toBe(
+      'workmux set-window-status working --session-id second',
+    );
   });
 
   test('reports waiting while another session is working', async () => {
