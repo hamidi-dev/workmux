@@ -725,6 +725,7 @@ mod tests {
             window_name: Some("wm-test".to_string()),
             session_name: Some("main".to_string()),
             boot_id: None,
+            agent_session_id: None,
             agent_kind: None,
         }
     }

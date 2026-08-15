@@ -4,15 +4,20 @@ import { WorkmuxStatusPlugin } from '../resources/opencode/plugins/workmux-statu
 
 async function createHarness() {
   const statuses: string[] = [];
-  const shell = (_strings: TemplateStringsArray, status: string) => ({
+  const commands: string[] = [];
+  const shell = (strings: TemplateStringsArray, ...values: string[]) => ({
     quiet: async () => {
-      statuses.push(status);
+      statuses.push(values[0]);
+      commands.push(
+        strings.reduce((acc, part, i) => acc + part + (values[i] ?? ''), '').trim(),
+      );
     },
   });
   const hooks = await WorkmuxStatusPlugin({ $: shell } as never);
 
   return {
     statuses,
+    commands,
     emit: async (event: unknown) => {
       await hooks.event?.({ event } as never);
     },
@@ -101,6 +106,36 @@ describe('WorkmuxStatusPlugin', () => {
     await harness.emit(userMessage('parent'));
     await harness.emit(sessionStatus('parent', 'busy'));
     expect(harness.statuses).toEqual(['working', 'done', 'working']);
+  });
+
+  test('reports the root session id and never a subagent one', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionStatus('parent', 'busy'));
+    await harness.emit(sessionStatus('child', 'busy'));
+    await harness.emit(sessionStatus('child', 'idle'));
+    await harness.emit(sessionStatus('parent', 'idle'));
+
+    expect(harness.commands).toEqual([
+      'workmux set-window-status working --session-id parent',
+      'workmux set-window-status done --session-id parent',
+    ]);
+  });
+
+  test('adopts a new root session after the old one is deleted', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionStatus('first', 'busy'));
+    await harness.emit(sessionStatus('first', 'idle'));
+    await harness.emit({
+      type: 'session.deleted',
+      properties: { info: { id: 'first' } },
+    });
+    await harness.emit(sessionStatus('second', 'busy'));
+
+    expect(harness.commands.at(-1)).toBe(
+      'workmux set-window-status working --session-id second',
+    );
   });
 
   test('reports waiting while another session is working', async () => {

@@ -716,6 +716,12 @@ enum Commands {
     SetWindowStatus {
         #[arg(value_enum)]
         command: command::set_window_status::SetWindowStatusCommand,
+
+        /// The agent's own session id, recorded against this pane. Agents that
+        /// pipe hook JSON containing `session_id` (Claude Code, Codex) are read
+        /// automatically and need not pass this.
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
     },
 
     /// Set the base branch for the current worktree (used after rebasing)
@@ -1096,7 +1102,10 @@ pub fn run() -> Result<()> {
             ClaudeCommands::Prune => prune_claude_config(),
         },
         Commands::Sandbox(args) => command::sandbox::run(args),
-        Commands::SetWindowStatus { command } => command::set_window_status::run(command),
+        Commands::SetWindowStatus {
+            command,
+            session_id,
+        } => command::set_window_status::run(command, session_id),
         Commands::SetBase { base } => command::set_base::run(&base),
         Commands::LastDone => command::last_done::run(),
         Commands::LastAgent => command::last_agent::run(),

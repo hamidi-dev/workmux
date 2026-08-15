@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::ValueEnum;
 use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::warn;
 
 use crate::config::Config;
@@ -74,14 +76,29 @@ impl StatusTarget {
     }
 }
 
-pub fn run(cmd: SetWindowStatusCommand) -> Result<()> {
+/// Key holding the agent's own session id in the JSON hooks pipe on stdin.
+/// Claude Code and Codex both use it; agents without a hook payload pass
+/// `--session-id` from their plugin instead.
+const HOOK_SESSION_ID_KEY: &str = "session_id";
+
+/// How long to wait for a piped hook payload. Hooks write their JSON and close
+/// immediately, so anything slower is a stdin we were never meant to read (an
+/// inherited pipe nobody closes) — and stalling an agent's hook to learn an
+/// optional id is a bad trade.
+const HOOK_STDIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+pub fn run(cmd: SetWindowStatusCommand, session_id: Option<String>) -> Result<()> {
     if std::env::var_os("WORKMUX_DISABLE_SET_WINDOW_STATUS").is_some() {
         return Ok(());
     }
 
+    let session_id = session_id
+        .filter(|id| !id.is_empty())
+        .or_else(session_id_from_hook_stdin);
+
     // Inside a sandbox guest, route through RPC to the host supervisor
     if crate::sandbox::guest::is_sandbox_guest() {
-        return run_via_rpc(cmd);
+        return run_via_rpc(cmd, session_id);
     }
 
     let config = Config::load(None)?;
@@ -91,7 +108,7 @@ pub fn run(cmd: SetWindowStatusCommand) -> Result<()> {
             let mux = create_backend_for_instance(target.backend, &target.instance);
             match mux.get_live_pane_info(&target.pane_id) {
                 Ok(Some(_)) => {
-                    return apply_status_update(&cmd, &config, &*mux, &target.pane_id);
+                    return apply_status_update(&cmd, &config, &*mux, &target.pane_id, session_id);
                 }
                 Ok(None) => {
                     warn!(
@@ -126,11 +143,45 @@ pub fn run(cmd: SetWindowStatusCommand) -> Result<()> {
     for backend in status_backend_candidates() {
         let mux = create_backend(backend);
         if let Some(pane_id) = resolve_status_pane_id(&*mux) {
-            return apply_status_update(&cmd, &config, &*mux, &pane_id);
+            return apply_status_update(&cmd, &config, &*mux, &pane_id, session_id);
         }
     }
 
     Ok(())
+}
+
+/// Read the agent's session id out of a hook payload piped on stdin.
+///
+/// Returns `None` for an interactive stdin (a human running the command) and
+/// for any payload that is not JSON carrying the key — this is opportunistic
+/// enrichment, never a reason to fail a status update.
+fn session_id_from_hook_stdin() -> Option<String> {
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Detached deliberately: if the read never completes, this short-lived
+    // process exits and takes the thread with it, rather than the agent's hook
+    // waiting on us.
+    std::thread::spawn(move || {
+        let mut payload = String::new();
+        let _ = tx.send(
+            std::io::stdin()
+                .read_to_string(&mut payload)
+                .ok()
+                .map(|_| payload),
+        );
+    });
+
+    let payload = rx.recv_timeout(HOOK_STDIN_TIMEOUT).ok()??;
+    session_id_from_hook_payload(&payload)
+}
+
+fn session_id_from_hook_payload(payload: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let id = value.get(HOOK_SESSION_ID_KEY)?.as_str()?.trim();
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 fn apply_status_update(
@@ -138,6 +189,7 @@ fn apply_status_update(
     config: &Config,
     mux: &dyn Multiplexer,
     pane_id: &str,
+    session_id: Option<String>,
 ) -> Result<()> {
     match cmd {
         SetWindowStatusCommand::Clear => mux.clear_status(&pane_id)?,
@@ -166,7 +218,7 @@ fn apply_status_update(
             mux.set_status(&pane_id, icon, auto_clear)?;
 
             // Persist to state store so the dashboard sees this agent
-            crate::state::persist_agent_update(&*mux, &pane_id, Some(status), None);
+            crate::state::persist_agent_update(&*mux, &pane_id, Some(status), None, session_id);
         }
     }
 
@@ -286,7 +338,7 @@ fn normalized_path(path: &Path) -> PathBuf {
 }
 
 /// Send a status update via RPC when running inside a sandbox guest.
-fn run_via_rpc(cmd: SetWindowStatusCommand) -> Result<()> {
+fn run_via_rpc(cmd: SetWindowStatusCommand, session_id: Option<String>) -> Result<()> {
     use crate::sandbox::rpc::{RpcClient, RpcRequest, RpcResponse};
 
     let status = match cmd {
@@ -299,6 +351,7 @@ fn run_via_rpc(cmd: SetWindowStatusCommand) -> Result<()> {
     let mut client = RpcClient::from_env()?;
     let response = client.call(&RpcRequest::SetStatus {
         status: status.to_string(),
+        session_id,
     })?;
 
     match response {

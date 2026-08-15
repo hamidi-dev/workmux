@@ -242,6 +242,7 @@ mod tests {
             window_name: None,
             session_name: None,
             boot_id: None,
+            agent_session_id: None,
             agent_kind: agent_kind.map(|kind| kind.to_string()),
         }
     }

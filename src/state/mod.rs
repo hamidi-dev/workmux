@@ -35,6 +35,7 @@ pub(crate) fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
 /// - If `status` is Some, updates the agent's status. If None, preserves existing.
 /// - If `title_override` is Some, uses it. If None, preserves existing stored title,
 ///   falling back to the live pane title.
+/// - If `agent_session_id` is Some, records it. If None, preserves existing.
 ///
 /// Logs warnings on failure without propagating errors (best-effort persistence).
 pub fn persist_agent_update(
@@ -42,6 +43,7 @@ pub fn persist_agent_update(
     pane_id: &str,
     status: Option<AgentStatus>,
     title_override: Option<String>,
+    agent_session_id: Option<String>,
 ) {
     let pane_key = PaneKey {
         backend: mux.name().to_string(),
@@ -84,6 +86,12 @@ pub fn persist_agent_update(
     // Capture existing agent_kind before `existing` is consumed below.
     let existing_agent_kind = existing.as_ref().and_then(|e| e.agent_kind.clone());
 
+    // A caller that knows the agent's session id wins; otherwise keep what was
+    // recorded. Hooks that fire without one (a plain `set-window-status done`)
+    // must not erase an id an earlier event already established.
+    let agent_session_id =
+        agent_session_id.or_else(|| existing.as_ref().and_then(|e| e.agent_session_id.clone()));
+
     // Snapshot the live title for classification before the resolved
     // `pane_title` consumes `live_info.title`.
     let live_title_for_classify = live_info.title.clone();
@@ -123,6 +131,7 @@ pub fn persist_agent_update(
         window_name: live_info.window,
         session_name: live_info.session,
         boot_id,
+        agent_session_id,
         agent_kind,
     };
 

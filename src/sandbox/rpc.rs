@@ -26,6 +26,10 @@ use crate::sandbox::constant_time::constant_time_eq;
 pub enum RpcRequest {
     SetStatus {
         status: String,
+        /// The agent's own session id, when the guest's hook reported one.
+        /// Defaulted so a guest running an older workmux still parses here.
+        #[serde(default)]
+        session_id: Option<String>,
     },
     SetTitle {
         title: String,
@@ -406,7 +410,9 @@ where
 fn dispatch_request(request: &RpcRequest, ctx: &RpcContext) -> RpcResponse {
     match request {
         RpcRequest::Heartbeat => RpcResponse::Ok,
-        RpcRequest::SetStatus { status } => handle_set_status(status, ctx),
+        RpcRequest::SetStatus { status, session_id } => {
+            handle_set_status(status, session_id.clone(), ctx)
+        }
         RpcRequest::SetTitle { title } => handle_set_title(title, ctx),
         RpcRequest::SpawnAgent {
             prompt,
@@ -436,7 +442,7 @@ fn dispatch_request(request: &RpcRequest, ctx: &RpcContext) -> RpcResponse {
 
 // ── Handlers ────────────────────────────────────────────────────────────
 
-fn handle_set_status(status: &str, ctx: &RpcContext) -> RpcResponse {
+fn handle_set_status(status: &str, session_id: Option<String>, ctx: &RpcContext) -> RpcResponse {
     // Reuse the same logic as set_window_status command
     let config = match Config::load(None) {
         Ok(c) => c,
@@ -491,6 +497,7 @@ fn handle_set_status(status: &str, ctx: &RpcContext) -> RpcResponse {
                     &ctx.pane_id,
                     Some(agent_status),
                     None,
+                    session_id,
                 );
             }
             RpcResponse::Ok
@@ -516,6 +523,7 @@ fn handle_set_title(title: &str, ctx: &RpcContext) -> RpcResponse {
                 &ctx.pane_id,
                 None,
                 Some(title.to_string()),
+                None,
             );
             RpcResponse::Ok
         }
@@ -988,6 +996,7 @@ mod tests {
     fn test_request_serialization_set_status() {
         let req = RpcRequest::SetStatus {
             status: "working".to_string(),
+            session_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"SetStatus\""));

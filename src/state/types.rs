@@ -116,6 +116,16 @@ pub struct AgentState {
     #[serde(default)]
     pub boot_id: Option<String>,
 
+    /// The agent's own session identifier, as reported by the agent that runs
+    /// in this pane (Claude Code / Codex hook JSON, OpenCode plugin event).
+    ///
+    /// Workmux does not interpret it; it exists so that tools which key their
+    /// own data by agent session (see `sidebar.extras`) can be joined to the
+    /// pane the session runs in. Subagent sessions never overwrite it: the
+    /// pane belongs to the root session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+
     /// Cached agent identity (canonical profile name, e.g. "claude", "kiro-cli").
     ///
     /// Classified once by `crate::agent_identity::classify_agent_kind` from the
