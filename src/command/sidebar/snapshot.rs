@@ -49,6 +49,10 @@ pub struct SidebarSnapshot {
     /// GitHub check summary per worktree path (computed by daemon background worker).
     #[serde(default)]
     pub check_statuses: HashMap<PathBuf, CheckSummary>,
+    /// External `sidebar.extras` values per pane ID, keyed by extra name
+    /// (collected by the daemon's extras worker).
+    #[serde(default)]
+    pub extras: HashMap<String, HashMap<String, String>>,
     /// Pane IDs of agents detected as interrupted (working but no pane output change).
     #[serde(default)]
     pub interrupted_pane_ids: HashSet<String>,
@@ -435,6 +439,7 @@ pub(crate) fn build_snapshot(input: SnapshotInputs) -> SidebarSnapshot {
         pr_statuses,
         check_statuses,
         interrupted_pane_ids,
+        extras: HashMap::new(),
         sleeping_pane_ids: live_sleeping,
         group_by,
         expanded_groups,
@@ -1006,6 +1011,17 @@ mod tests {
         );
 
         assert!(!snapshot.check_statuses.contains_key(&path));
+    }
+
+    #[test]
+    fn snapshots_without_extras_deserialize_with_an_empty_map() {
+        let snapshot = build(vec![agent("/repo")], HashMap::new(), HashMap::new());
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        value.as_object_mut().unwrap().remove("extras");
+
+        let restored: SidebarSnapshot = serde_json::from_value(value).unwrap();
+
+        assert!(restored.extras.is_empty());
     }
 
     #[test]

@@ -25,23 +25,52 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $, client }) => {
   let reportedSession: string | undefined;
   let statusQueue = Promise.resolve();
 
-  function writeStatus(status: string, prompt?: string) {
+  function writeStatus(status: string, sessionID: string | undefined, prompt?: string) {
     // An explicit --session-id deliberately skips stdin. Send both fields in
     // the hook payload when a prompt needs to travel with the identity.
     const command = prompt !== undefined
-      ? $`workmux set-window-status ${status} < ${new Response(JSON.stringify({ prompt, session_id: rootSession }))}`
-      : rootSession
-        ? $`workmux set-window-status ${status} --session-id ${rootSession}`
+      ? $`workmux set-window-status ${status} < ${new Response(JSON.stringify({ prompt, session_id: sessionID }))}`
+      : sessionID
+        ? $`workmux set-window-status ${status} --session-id ${sessionID}`
         : $`workmux set-window-status ${status}`;
     return command.quiet().then(() => {}, () => {});
   }
 
-  function queueStatus(status: string, prompt?: string) {
+  function queueStatus(status: string, sessionID: string | undefined, prompt?: string) {
     statusQueue = statusQueue.then(
-      () => writeStatus(status, prompt),
-      () => writeStatus(status, prompt),
+      () => writeStatus(status, sessionID, prompt),
+      () => writeStatus(status, sessionID, prompt),
     );
     return statusQueue;
+  }
+  // Sessions OpenCode created underneath another session -- subagent work,
+  // never the pane's conversation.
+  const childSessions = new Set<string>();
+  // Sessions that were already running when the root was deleted. They are its
+  // descendants, so none of them may inherit the empty root slot -- only a
+  // session started afterwards can be what the pane is now about.
+  const ineligibleRoots = new Set<string>();
+
+  // Give the pane's session slot to `sessionID`, unless it is a subagent's.
+  //
+  // `createdTopLevel` marks positive proof from `session.created`: no parent
+  // id, so it is a new conversation and may claim the slot even if it was
+  // previously written off as a descendant.
+  function claimRoot(sessionID: string, createdTopLevel = false): boolean {
+    if (childSessions.has(sessionID)) {
+      return false;
+    }
+    if (!createdTopLevel && ineligibleRoots.has(sessionID)) {
+      return false;
+    }
+
+    ineligibleRoots.delete(sessionID);
+    if (rootSession === sessionID) {
+      return false;
+    }
+
+    rootSession = sessionID;
+    return true;
   }
 
   // A pending prompt rides the next `working` report, even a repeated one.
@@ -89,7 +118,28 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $, client }) => {
 
     reportedStatus = status;
     reportedSession = rootSession;
-    await queueStatus(status, takePrompt(status));
+    await queueStatus(status, rootSession, takePrompt(status));
+  }
+
+  function recordStatus(sessionID: string, status: string): boolean {
+    const previous = statusBySession.get(sessionID);
+    // Ignore the final stale `busy` OpenCode sometimes emits after a session is
+    // already done. The next user message re-arms `working` for the new turn.
+    if (status === 'working' && acceptBusyBySession.get(sessionID) === false) {
+      return false;
+    }
+    if (previous === status) {
+      return false;
+    }
+
+    statusBySession.set(sessionID, status);
+    if (status === 'done') {
+      acceptBusyBySession.set(sessionID, false);
+    } else {
+      acceptBusyBySession.set(sessionID, true);
+    }
+
+    return true;
   }
 
   async function setStatus(
@@ -100,29 +150,26 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $, client }) => {
       return;
     }
 
-    rootSession ??= sessionID;
+    // A session seen while no root is known was created before this plugin
+    // loaded, i.e. the conversation the client resumed. Sessions created
+    // afterwards claim the slot through `session.created` or a user message,
+    // never through activity alone: a finished session still emits a trailing
+    // `idle` and must not take the pane back from its successor.
+    const rootChanged = !rootSession && claimRoot(sessionID);
 
-    const previous = statusBySession.get(sessionID);
-    if (status === 'done' && previous === undefined) {
+    // A `done` for a session never seen active says nothing about the pane --
+    // OpenCode emits these for conversations that predate this plugin. The
+    // aggregate would be empty and report a false completion, so stop here;
+    // the root claim above still stands.
+    if (status === 'done' && !statusBySession.has(sessionID)) {
       return;
     }
-    // Ignore the final stale `busy` OpenCode sometimes emits after a session is
-    // already done. The next user message re-arms `working` for the new turn.
-    if (status === 'working' && acceptBusyBySession.get(sessionID) === false) {
-      return;
-    }
-    if (previous === status) {
-      return;
-    }
 
-    statusBySession.set(sessionID, status);
-    if (status === 'done') {
-      acceptBusyBySession.set(sessionID, false);
-    } else {
-      acceptBusyBySession.set(sessionID, true);
-    }
+    const statusChanged = recordStatus(sessionID, status);
 
-    await reportAggregateStatus();
+    if (statusChanged || rootChanged) {
+      await reportAggregateStatus();
+    }
   }
 
   return {
@@ -137,19 +184,37 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $, client }) => {
         return;
       }
       pendingPrompt = prompt;
+      claimRoot(sessionID, true);
       // A message queued while the agent works starts no new busy transition.
       if (reportedStatus === 'working') {
-        await queueStatus('working', takePrompt('working'));
+        await queueStatus('working', rootSession, takePrompt('working'));
       }
     },
     event: async ({ event }) => {
       if (event.type === 'message.updated' && event.properties.info.role === 'user') {
-        acceptBusyBySession.set(event.properties.sessionID, true);
+        const sessionID = event.properties.sessionID;
+        acceptBusyBySession.set(sessionID, true);
+        // The user is talking to this session, so the pane is about it. Covers
+        // switching back to an earlier conversation, which creates nothing.
+        if (claimRoot(sessionID)) {
+          await reportAggregateStatus();
+        }
       }
 
       switch (event.type) {
         case 'session.created':
           childBySession.set(event.properties.info.id, Boolean(event.properties.info.parentID));
+          // A session with a parent is a subagent's and never owns the pane.
+          // One without is a new conversation in this client -- `/new` leaves
+          // the previous session alive, so waiting for a deletion would pin
+          // the pane to the first conversation for the whole process.
+          if (event.properties.info.parentID) {
+            childSessions.add(event.properties.info.id);
+            break;
+          }
+          if (claimRoot(event.properties.info.id, true)) {
+            await reportAggregateStatus();
+          }
           break;
         case 'session.status':
           if (event.properties.status.type === 'busy') {
@@ -175,11 +240,16 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $, client }) => {
           deletedSessions.add(sessionID);
           acceptBusyBySession.delete(sessionID);
           childBySession.delete(sessionID);
+          childSessions.delete(sessionID);
           const tracked = statusBySession.delete(sessionID);
-          // Losing the root session frees the slot: whatever this client works
-          // on next is the pane's session now.
+          // Losing the root session frees the slot for a session started
+          // later -- but not for one of its own children, which are still
+          // being tracked and would otherwise claim it on their next event.
           if (rootSession === sessionID) {
             rootSession = undefined;
+            for (const id of statusBySession.keys()) {
+              ineligibleRoots.add(id);
+            }
           }
           if (tracked) {
             await reportAggregateStatus();

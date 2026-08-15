@@ -634,6 +634,35 @@ pub struct SidebarConfig {
     /// a single line instead of a full tile. Part of the grouped presentation,
     /// so it has no effect while grouping is off. Default: true.
     pub collapse_stale: Option<bool>,
+
+    /// External per-agent values, rendered as `{extra:<name>}`. Global-only.
+    #[serde(default)]
+    pub extras: Option<BTreeMap<String, SidebarExtraConfig>>,
+}
+
+/// One external value source for the sidebar.
+///
+/// The daemon runs `command` on a timer, writes the session id of every known
+/// agent to its stdin (one per line), and reads back `<session-id><TAB><value>`
+/// lines. Sessions the command has nothing to say about are simply omitted and
+/// render as an empty token.
+///
+/// Global config only, deliberately: a project's `.workmux.yaml` travels with a
+/// cloned repository, and a checkout must never be able to choose a command
+/// workmux then runs.
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct SidebarExtraConfig {
+    /// Command and arguments, argv style (no shell).
+    pub command: Vec<String>,
+
+    /// Seconds between runs. Default 30, floored at 5.
+    pub interval_secs: Option<u64>,
+}
+
+impl SidebarExtraConfig {
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.interval_secs.unwrap_or(30).max(5))
+    }
 }
 
 impl SidebarConfig {
@@ -664,6 +693,21 @@ impl SidebarConfig {
             mode => Some(mode),
         }
     }
+
+    /// Configured extras, keyed by template name.
+    pub fn extras(&self) -> &BTreeMap<String, SidebarExtraConfig> {
+        static EMPTY: std::sync::LazyLock<BTreeMap<String, SidebarExtraConfig>> =
+            std::sync::LazyLock::new(BTreeMap::new);
+        self.extras.as_ref().unwrap_or(&EMPTY)
+    }
+}
+
+/// Whether `name` is usable as `{extra:<name>}` in a template.
+pub fn is_valid_extra_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Sidebar row ordering within a group, or within the whole list when
@@ -3039,6 +3083,17 @@ impl Config {
             .container
             .validate()
             .context("Invalid sandbox container config")?;
+        for (name, extra) in config.sidebar.extras() {
+            if !is_valid_extra_name(name) {
+                anyhow::bail!(
+                    "sidebar.extras key '{name}' is not a valid template name \
+                     (lowercase letters, digits and underscores only)"
+                );
+            }
+            if extra.command.is_empty() {
+                anyhow::bail!("sidebar.extras.{name}.command must not be empty");
+            }
+        }
 
         Ok(config)
     }
@@ -3305,6 +3360,15 @@ impl Config {
                 .sidebar
                 .collapse_stale
                 .or(self.sidebar.collapse_stale),
+            extras: {
+                if project.sidebar.extras.is_some() {
+                    tracing::warn!(
+                        "sidebar.extras in project config (.workmux.yaml) is ignored -- \
+                         move it to your global config (~/.config/workmux/config.yaml)"
+                    );
+                }
+                self.sidebar.extras
+            },
         };
 
         // Sandbox config: per-field override with nested struct merging
@@ -3999,9 +4063,9 @@ mod tests {
         ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, DashboardLayout,
         ExtraMount, FileConfig, LayoutConfig, LimaConfig, NODE_MODULES_CLEANUP_SCRIPT,
         NetworkConfig, NetworkPolicy, PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget,
-        SidebarEnterAction, SidebarHeight, SidebarPosition, SidebarWidth, SplitDirection,
-        ToolchainMode, WindowPlacement, WorktreeColumn, is_agent_command, validate_domain,
-        validate_group_add_entry, validate_layouts_config,
+        SidebarEnterAction, SidebarExtraConfig, SidebarHeight, SidebarPosition, SidebarWidth,
+        SplitDirection, ToolchainMode, WindowPlacement, WorktreeColumn, is_agent_command,
+        is_valid_extra_name, validate_domain, validate_group_add_entry, validate_layouts_config,
     };
     use super::{DashboardConfig, InputExitKey};
     use crate::test_support;
@@ -5200,6 +5264,47 @@ sidebar:
 
         assert_eq!(merged.sidebar.dim_stale, Some(false));
         assert!(!merged.sidebar.dim_stale());
+    }
+
+    #[test]
+    fn sidebar_extras_are_global_only() {
+        let global: Config =
+            serde_yaml::from_str("sidebar:\n  extras:\n    price:\n      command: [globalcmd]\n")
+                .unwrap();
+        let project: Config =
+            serde_yaml::from_str("sidebar:\n  extras:\n    price:\n      command: [projectcmd]\n")
+                .unwrap();
+
+        let merged = global.merge(project);
+
+        assert_eq!(
+            merged.sidebar.extras()["price"].command,
+            vec!["globalcmd".to_string()]
+        );
+    }
+
+    #[test]
+    fn sidebar_extra_interval_has_a_floor() {
+        let extra = SidebarExtraConfig {
+            command: vec!["true".to_string()],
+            interval_secs: Some(1),
+        };
+
+        assert_eq!(extra.interval(), std::time::Duration::from_secs(5));
+        assert_eq!(
+            SidebarExtraConfig::default().interval(),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn extra_names_must_be_template_safe() {
+        assert!(is_valid_extra_name("price"));
+        assert!(is_valid_extra_name("token_count2"));
+        assert!(!is_valid_extra_name(""));
+        assert!(!is_valid_extra_name("Price"));
+        assert!(!is_valid_extra_name("git stats"));
+        assert!(!is_valid_extra_name("a:b"));
     }
 
     #[test]

@@ -27,6 +27,19 @@ pub trait TemplateRow {
         display_width(&self.resolve(token))
     }
 
+    /// External values belong to agents; headers render them as empty fields.
+    fn resolve_extra(&self, _name: &str) -> String {
+        String::new()
+    }
+
+    fn extra_width(&self, name: &str) -> usize {
+        display_width(&self.resolve_extra(name))
+    }
+
+    fn extra_style(&self) -> Style {
+        Style::default()
+    }
+
     /// Pre-styled spans for `{status_icon}`.
     fn status_icon_spans(&self) -> &[(String, Style)] {
         &[]

@@ -137,7 +137,7 @@ pub fn is_blank_template_line(tokens: &[Token]) -> bool {
     tokens.iter().all(|token| match token {
         Token::Literal(s) => s.trim().is_empty(),
         Token::Fill | Token::Style(_) => true,
-        Token::Field(_) => false,
+        Token::Field(_) | Token::Extra(_) => false,
     })
 }
 
@@ -176,6 +176,12 @@ impl TokenInfo {
                 is_flex: id.is_flex(),
                 is_field: true,
             },
+            Token::Extra(name) => Self {
+                token: Token::Extra(name.clone()),
+                natural_width: ctx.extra_width(name),
+                is_flex: false,
+                is_field: true,
+            },
         }
     }
 }
@@ -186,8 +192,8 @@ impl TokenInfo {
 fn collapse_empty_fields(infos: Vec<TokenInfo>) -> Vec<TokenInfo> {
     let mut keep = vec![true; infos.len()];
     for i in 0..infos.len() {
-        let is_empty_field =
-            matches!(infos[i].token, Token::Field(_)) && infos[i].natural_width == 0;
+        let is_empty_field = matches!(infos[i].token, Token::Field(_) | Token::Extra(_))
+            && infos[i].natural_width == 0;
         if !is_empty_field {
             continue;
         }
@@ -277,6 +283,7 @@ fn render_common_token(
             false
         }
         Token::Fill => false,
+        Token::Extra(_) => true,
         Token::Style(directive) => {
             *user_style = apply_tmux_directives(*user_style, directive, Style::default());
             false
@@ -303,10 +310,11 @@ fn render_with_layout(
     // Render left segment
     for info in left {
         if render_common_token(info, ctx, &mut user_style, &mut spans, &mut used_width) {
-            let Token::Field(id) = info.token else {
-                continue;
-            };
             if info.is_flex && !first_flex_assigned {
+                // Only field tokens are ever flex.
+                let Token::Field(id) = info.token else {
+                    continue;
+                };
                 // First flex token: truncate if natural exceeds slack, otherwise
                 // render at natural width and emit the leftover as a fill-space
                 // span between left and right segments (handled after the loop).
@@ -324,10 +332,10 @@ fn render_with_layout(
             } else {
                 // Non-flex or subsequent flex: render at natural width
                 let max_w = width.saturating_sub(used_width);
-                used_width += render_field(
+                used_width += render_token_value(
                     &mut spans,
                     ctx,
-                    id,
+                    &info.token,
                     info.natural_width.min(max_w),
                     max_w,
                     user_style,
@@ -357,14 +365,11 @@ fn render_with_layout(
     // Render right segment
     for info in right {
         if render_common_token(info, ctx, &mut user_style, &mut spans, &mut used_width) {
-            let Token::Field(id) = info.token else {
-                continue;
-            };
             let max_w = width.saturating_sub(used_width);
-            used_width += render_field(
+            used_width += render_token_value(
                 &mut spans,
                 ctx,
-                id,
+                &info.token,
                 info.natural_width.min(max_w),
                 max_w,
                 user_style,
@@ -384,6 +389,56 @@ fn render_with_layout(
     }
 
     spans
+}
+
+/// Render whichever value-bearing token this is; layout treats built-in fields
+/// and `{extra:<name>}` values identically once their width is known.
+fn render_token_value(
+    spans: &mut Vec<Span<'static>>,
+    ctx: &(impl TemplateRow + ?Sized),
+    token: &Token,
+    target_width: usize,
+    max_width: usize,
+    user_style: Style,
+) -> usize {
+    match token {
+        Token::Field(id) => render_field(spans, ctx, *id, target_width, max_width, user_style),
+        Token::Extra(name) => render_extra(spans, ctx, name, target_width, max_width, user_style),
+        _ => 0,
+    }
+}
+
+fn render_extra(
+    spans: &mut Vec<Span<'static>>,
+    ctx: &(impl TemplateRow + ?Sized),
+    name: &str,
+    target_width: usize,
+    max_width: usize,
+    user_style: Style,
+) -> usize {
+    if target_width == 0 {
+        return 0;
+    }
+
+    let text = ctx.resolve_extra(name);
+    let rendered = if display_width(&text) > target_width {
+        truncate_with_ellipsis(&text, target_width)
+    } else {
+        text
+    };
+    let rendered_width = display_width(&rendered);
+    spans.push(styled_span(rendered, ctx.extra_style(), user_style, ctx));
+
+    let target_width = target_width.min(max_width);
+    if rendered_width < target_width {
+        spans.push(styled_span(
+            " ".repeat(target_width - rendered_width),
+            Style::default(),
+            user_style,
+            ctx,
+        ));
+    }
+    rendered_width.max(target_width)
 }
 
 fn render_field(
@@ -538,6 +593,7 @@ mod tests {
             project: "myproject".to_string(),
             pane_suffix: String::new(),
             elapsed: "5:23".to_string(),
+            extras: std::collections::HashMap::new(),
             status_icon_spans: vec![("💤".to_string(), ratatui::style::Style::default())],
             status_color: ratatui::style::Color::Reset,
             pane_title: None,
@@ -565,6 +621,35 @@ mod tests {
         // left gets 20 - 4 - 2 = 14; primary is 12 so padded by 2
         assert!(text.contains("feature-auth"));
         assert!(text.contains("5:23"));
+    }
+
+    #[test]
+    fn extra_renders_and_collapses_cleanly_when_missing() {
+        let agent = test_agent("foo");
+        let mut ctx = make_context(&agent);
+        ctx.extras.insert("price".to_string(), "~$0.42".to_string());
+        let template = tokens("{extra:price} {elapsed}");
+
+        let with_value = render_text(&ctx, &template, 30);
+        assert_eq!(with_value.trim(), "~$0.42 5:23");
+
+        // An extra nobody configured leaves no gap behind.
+        ctx.extras.clear();
+        let without_value = render_text(&ctx, &template, 30);
+        assert_eq!(without_value.trim(), "5:23");
+    }
+
+    #[test]
+    fn header_collapses_agent_extras_without_losing_group_fields() {
+        let ctx = super::super::row::HeaderContext {
+            label: "myproject".to_string(),
+            count: 2,
+            statuses: Vec::new(),
+            palette: test_palette(),
+        };
+        let spans = render_line(&ctx, &tokens("{group} {extra:price} {group_count}"), 20);
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text.trim(), "myproject 2");
     }
 
     #[test]
