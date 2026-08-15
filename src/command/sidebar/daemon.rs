@@ -106,6 +106,7 @@ fn snapshots_equal(
         check_statuses: _,
         interrupted_pane_ids: _,
         sleeping_pane_ids: _,
+        extras: _,
         agents: _,
         config_version: _,
     } = left;
@@ -121,6 +122,7 @@ fn snapshots_equal(
         && left.check_statuses == right.check_statuses
         && left.interrupted_pane_ids == right.interrupted_pane_ids
         && left.sleeping_pane_ids == right.sleeping_pane_ids
+        && left.extras == right.extras
         && left.agents == right.agents
         && left.config_version == right.config_version
 }
@@ -329,6 +331,242 @@ fn read_sidebar_position(config: &Config, tmux_value: Option<&str>) -> SidebarPo
 
 /// Shared git status cache, updated by a background worker thread.
 type GitCache = Arc<Mutex<HashMap<PathBuf, GitStatus>>>;
+
+/// Longest value an extras command may contribute, in characters. A sidebar
+/// cell is a few columns wide; anything longer is a runaway command, not a
+/// value someone meant to display.
+const EXTRA_VALUE_MAX_CHARS: usize = 32;
+
+/// How long an extras command may run before it is abandoned for this round.
+const EXTRA_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most output an extras command may contribute. One short line per agent, so
+/// this is orders of magnitude of headroom; it exists to bound a runaway.
+const EXTRA_OUTPUT_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Parse an extras command's `<session-id><TAB><value>` output.
+///
+/// Malformed lines are dropped rather than failing the round: a command that
+/// prints a warning alongside its table should still contribute its table.
+/// Control characters are rejected outright — this text is written straight
+/// into a terminal, and an escape sequence in it would repaint the sidebar.
+fn parse_extra_values(output: &str) -> HashMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (session_id, value) = line.split_once('\t')?;
+            let value = value.trim_end_matches(['\r', '\n']);
+            (!session_id.is_empty()
+                && !value.is_empty()
+                && value.chars().count() <= EXTRA_VALUE_MAX_CHARS
+                && !session_id.chars().any(char::is_control)
+                && !value.chars().any(char::is_control))
+            .then(|| (session_id.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// Run one extras command over `session_ids` and return its `id -> value` table.
+///
+/// `None` means "this round produced nothing usable" — a spawn failure, a
+/// timeout, or a nonzero exit. Callers keep the previous table in that case:
+/// a command that reports partial data (opentab's `cost --batch` exits 1
+/// when a backend read failed) would otherwise blank cells that were fine a
+/// moment ago.
+fn run_extra_command(
+    command: &[String],
+    session_ids: &[String],
+) -> Option<HashMap<String, String>> {
+    use std::io::{Read, Seek, Write};
+
+    let (program, args) = command.split_first()?;
+
+    // Temp files, not pipes: a pipe would tie this thread to a process it does
+    // not control. Writing ids blocks forever if the command never reads them,
+    // and stdout reaches EOF only once every process holding the write end
+    // exits -- a backgrounded grandchild keeps it open long past its parent.
+    // Against a file the deadline below is the only thing we depend on.
+    let mut stdin_file = tempfile::tempfile().ok()?;
+    for session_id in session_ids {
+        writeln!(stdin_file, "{session_id}").ok()?;
+    }
+    stdin_file.rewind().ok()?;
+    let mut stdout_file = tempfile::tempfile().ok()?;
+
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::from(stdin_file))
+        .stdout(std::process::Stdio::from(stdout_file.try_clone().ok()?))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| tracing::debug!(%program, %error, "extras command failed to start"))
+        .ok()?;
+
+    let deadline = Instant::now() + EXTRA_COMMAND_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => {
+                tracing::debug!(%program, "extras command reported failure; keeping previous values");
+                return None;
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::warn!(%program, "extras command timed out");
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(%program, %error, "failed to wait on extras command");
+                return None;
+            }
+        }
+    }
+
+    // Bounded: a runaway is already capped by the timeout, but no reason to
+    // hold everything it managed to write.
+    let mut output = String::new();
+    stdout_file.rewind().ok()?;
+    stdout_file
+        .take(EXTRA_OUTPUT_MAX_BYTES)
+        .read_to_string(&mut output)
+        .ok()?;
+    Some(parse_extra_values(&output))
+}
+
+/// `extra name -> (session id -> value)`, refreshed by the extras worker.
+type ExtrasCache = Arc<Mutex<HashMap<String, HashMap<String, String>>>>;
+
+/// Background worker running the configured `sidebar.extras` commands.
+///
+/// One worker for every extra, on its own interval, off the render path — the
+/// same shape as the git and GitHub workers. It receives the set of live agent
+/// session ids from the tick loop; an empty set means there is nothing to ask
+/// about, so no command runs at all.
+fn spawn_extras_worker(
+    term: Arc<AtomicBool>,
+    dirty_flag: Arc<AtomicBool>,
+    wake_tx: mpsc::SyncSender<()>,
+    config: Arc<Mutex<Config>>,
+) -> (ExtrasCache, mpsc::Sender<Vec<String>>) {
+    let cache: ExtrasCache = Arc::new(Mutex::new(HashMap::new()));
+    let cache_clone = cache.clone();
+    let (tx, rx) = mpsc::channel::<Vec<String>>();
+
+    thread::spawn(move || {
+        let mut session_ids: Vec<String> = Vec::new();
+        let mut last_run: HashMap<String, Instant> = HashMap::new();
+
+        while !term.load(Ordering::Relaxed) {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(ids) => {
+                    session_ids = ids;
+                    while let Ok(ids) = rx.try_recv() {
+                        session_ids = ids;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            let extras: Vec<(String, Vec<String>, Duration)> = {
+                let cfg = config.lock().unwrap();
+                cfg.sidebar
+                    .extras()
+                    .iter()
+                    .map(|(name, extra)| (name.clone(), extra.command.clone(), extra.interval()))
+                    .collect()
+            };
+
+            // Drop values for extras the user removed from the config, so a
+            // deleted extra's last table cannot linger in the sidebar.
+            let configured: HashSet<&String> = extras.iter().map(|(name, _, _)| name).collect();
+            if let Ok(mut cache) = cache_clone.lock() {
+                cache.retain(|name, _| configured.contains(name));
+            }
+            last_run.retain(|name, _| configured.contains(name));
+
+            if session_ids.is_empty() {
+                continue;
+            }
+
+            let mut changed = false;
+            for (name, command, interval) in extras {
+                if last_run
+                    .get(&name)
+                    .is_some_and(|run| run.elapsed() < interval)
+                {
+                    continue;
+                }
+                last_run.insert(name.clone(), Instant::now());
+
+                let Some(values) = run_extra_command(&command, &session_ids) else {
+                    continue;
+                };
+                if let Ok(mut cache) = cache_clone.lock()
+                    && cache.get(&name) != Some(&values)
+                {
+                    cache.insert(name, values);
+                    changed = true;
+                }
+            }
+
+            if changed {
+                dirty_flag.store(true, Ordering::Relaxed);
+                let _ = wake_tx.try_send(());
+            }
+        }
+    });
+
+    (cache, tx)
+}
+
+/// Agent session ids by pane, for the multiplexer instance this daemon serves.
+///
+/// Read from the state store rather than from a tmux option: the id is put
+/// there by workmux's own hooks (`set-window-status --session-id`, or the
+/// `session_id` an agent pipes into that hook), so this works on every backend
+/// and needs nothing configured in the user's multiplexer.
+fn read_agent_session_ids(mux: &dyn Multiplexer) -> HashMap<String, String> {
+    let backend = mux.name();
+    let instance = mux.instance_id();
+    StateStore::new()
+        .and_then(|store| store.list_all_agents())
+        .map(|agents| {
+            agents
+                .into_iter()
+                .filter(|agent| {
+                    agent.pane_key.backend == backend && agent.pane_key.instance == instance
+                })
+                .filter_map(|agent| Some((agent.pane_key.pane_id, agent.agent_session_id?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Join the extras tables (keyed by agent session id) onto panes.
+///
+/// The join is exact: an agent whose session id no extra answered for simply
+/// has no extras, and workmux never guesses one from the worktree path — two
+/// agents in one project would be indistinguishable that way.
+fn extras_by_pane(
+    extras: &HashMap<String, HashMap<String, String>>,
+    session_ids: &HashMap<String, String>,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut by_pane: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for (pane_id, session_id) in session_ids {
+        for (name, values) in extras {
+            if let Some(value) = values.get(session_id) {
+                by_pane
+                    .entry(pane_id.clone())
+                    .or_default()
+                    .insert(name.clone(), value.clone());
+            }
+        }
+    }
+    by_pane
+}
 
 /// Resolve the .git directory for a worktree path.
 /// For linked worktrees, .git is a file containing "gitdir: /path/to/real/gitdir".
@@ -2060,7 +2298,13 @@ pub fn run() -> Result<()> {
     let (git_cache, git_path_tx) =
         spawn_git_worker(term.clone(), publication_dirty.clone(), wake_tx.clone());
     let (pr_cache, check_cache, github_path_tx) =
-        spawn_github_worker(term.clone(), publication_dirty.clone(), wake_tx);
+        spawn_github_worker(term.clone(), publication_dirty.clone(), wake_tx.clone());
+    let (extras_cache, extras_session_tx) = spawn_extras_worker(
+        term.clone(),
+        publication_dirty.clone(),
+        wake_tx,
+        config.clone(),
+    );
 
     tmux.set_global_option(
         "@workmux_sidebar_daemon_pid",
@@ -2159,14 +2403,29 @@ pub fn run() -> Result<()> {
 
         if publish_pending && let Some((agents, tmux_state)) = &cached_inputs {
             publish_pending = false;
-            let (position, layout_mode, sort) = {
+            let (position, layout_mode, sort, extras_configured) = {
                 let cfg = config.lock().unwrap();
                 (
                     read_sidebar_position(&cfg, tmux_state.position.as_deref()),
                     read_sidebar_layout_mode(&cfg, tmux_state.layout.as_deref())
                         .unwrap_or_default(),
                     cfg.sidebar.sort.unwrap_or_default(),
+                    !cfg.sidebar.extras().is_empty(),
                 )
+            };
+            // Nothing configured, nothing to collect: an unused feature costs
+            // neither the state read nor the worker's wakeups.
+            let extras = if extras_configured {
+                let agent_session_ids = read_agent_session_ids(mux.as_ref());
+                let _ = extras_session_tx.send(agent_session_ids.values().cloned().collect());
+                let collected = extras_cache
+                    .lock()
+                    .ok()
+                    .map(|cache| cache.clone())
+                    .unwrap_or_default();
+                extras_by_pane(&collected, &agent_session_ids)
+            } else {
+                HashMap::new()
             };
             let now = Instant::now();
             let now_ts = SystemTime::now()
@@ -2192,6 +2451,7 @@ pub fn run() -> Result<()> {
                         .map(|c| c.clone())
                         .unwrap_or_default(),
                     sleeping_pane_ids: read_sleeping_panes(tmux_state.sleeping_panes.as_deref()),
+                    extras,
                 },
                 &mut inactivity_tracker,
                 &last_interrupted,
@@ -2366,6 +2626,7 @@ struct TickInput {
     pr_statuses: HashMap<PathBuf, PrPathEntry>,
     check_statuses: HashMap<PathBuf, CheckPathEntry>,
     sleeping_pane_ids: HashSet<String>,
+    extras: HashMap<String, HashMap<String, String>>,
 }
 
 /// A state-file write to apply after computing the tick.
@@ -2412,6 +2673,7 @@ fn compute_tick(
         pr_statuses,
         check_statuses,
         sleeping_pane_ids,
+        extras,
     } = input;
 
     // Phase 1: Inactivity detection
@@ -2453,6 +2715,7 @@ fn compute_tick(
         &sleeping_pane_ids,
     );
     snapshot.interrupted_pane_ids = interrupted.clone();
+    snapshot.extras = extras;
 
     // Phase 4: Determine runtime write side effect
     let runtime_write = if interrupted != *last_interrupted || heartbeat_due {
@@ -2750,6 +3013,140 @@ mod tests {
     }
 
     #[test]
+    fn extras_output_ignores_malformed_and_unsafe_rows() {
+        let values = parse_extra_values(&format!(
+            "ses_a\t~$0.42\nnot a row\tses_b\t$1.23\n\t$9\nses_c\t\nses_d\t\u{1b}[31mred\nses_e\t{}\n",
+            "x".repeat(EXTRA_VALUE_MAX_CHARS + 1)
+        ));
+
+        assert_eq!(values.get("ses_a").map(String::as_str), Some("~$0.42"));
+        assert_eq!(
+            values.len(),
+            1,
+            "empty, oversized and control-bearing rows all drop -- including a \
+             second tab, which means the command is not emitting this format"
+        );
+    }
+
+    #[test]
+    fn extras_join_panes_by_exact_session_id() {
+        let extras = HashMap::from([
+            (
+                "price".to_string(),
+                HashMap::from([
+                    ("ses_current".to_string(), "~$0.42".to_string()),
+                    ("ses_other".to_string(), "$9.99".to_string()),
+                ]),
+            ),
+            (
+                "tokens".to_string(),
+                HashMap::from([("ses_current".to_string(), "12k".to_string())]),
+            ),
+        ]);
+        let session_ids = HashMap::from([
+            ("%1".to_string(), "ses_unanswered".to_string()),
+            ("%2".to_string(), "ses_current".to_string()),
+        ]);
+
+        assert_eq!(
+            extras_by_pane(&extras, &session_ids),
+            HashMap::from([(
+                "%2".to_string(),
+                HashMap::from([
+                    ("price".to_string(), "~$0.42".to_string()),
+                    ("tokens".to_string(), "12k".to_string()),
+                ])
+            )])
+        );
+    }
+
+    #[test]
+    fn extras_command_receives_session_ids_and_returns_its_table() {
+        let values = run_extra_command(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                r#"while read id; do printf '%s\t$1.00\n' "$id"; done"#.to_string(),
+            ],
+            &["ses_a".to_string(), "ses_b".to_string()],
+        );
+
+        assert_eq!(
+            values,
+            Some(HashMap::from([
+                ("ses_a".to_string(), "$1.00".to_string()),
+                ("ses_b".to_string(), "$1.00".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn extras_command_returns_when_a_grandchild_still_holds_stdout() {
+        // `sh` exits immediately but the backgrounded process inherits stdout,
+        // so a pipe here would not reach EOF until that process died -- past
+        // the timeout, wedging the worker for good. Reading a file instead
+        // means the exit is the only thing worth waiting for.
+        let started = Instant::now();
+        let values = run_extra_command(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 30 & printf 'ses_a\\t$1.00\\n'".to_string(),
+            ],
+            &["ses_a".to_string()],
+        );
+
+        assert_eq!(
+            values,
+            Some(HashMap::from([("ses_a".to_string(), "$1.00".to_string())]))
+        );
+        assert!(
+            started.elapsed() < EXTRA_COMMAND_TIMEOUT,
+            "waited on a grandchild instead of the command"
+        );
+    }
+
+    #[test]
+    fn extras_command_that_never_reads_stdin_still_times_out() {
+        // Feeding a command that ignores stdin must not block this thread
+        // before the deadline exists: the timeout has to bound the whole run,
+        // not just the part after the write.
+        let started = Instant::now();
+        let ids: Vec<String> = (0..5000).map(|n| format!("ses_{n:0>60}")).collect();
+
+        assert_eq!(
+            run_extra_command(&["sleep".to_string(), "60".to_string()], &ids),
+            None
+        );
+        assert!(
+            started.elapsed() < EXTRA_COMMAND_TIMEOUT + Duration::from_secs(5),
+            "the run outlived its own timeout"
+        );
+    }
+
+    #[test]
+    fn extras_command_failure_keeps_previous_values() {
+        // A command reporting an incomplete table (opentab's `cost --batch`
+        // exits 1 for that) must not blank cells that were correct before.
+        assert_eq!(
+            run_extra_command(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'ses_a\t$1.00\n'; exit 1".to_string(),
+                ],
+                &["ses_a".to_string()],
+            ),
+            None
+        );
+        assert_eq!(
+            run_extra_command(&["definitely-not-a-real-command".to_string()], &[]),
+            None
+        );
+        assert_eq!(run_extra_command(&[], &[]), None);
+    }
+
+    #[test]
     fn github_fetch_is_throttled_between_intervals() {
         assert!(!github_fetch_due(false, Duration::from_secs(29)));
         assert!(github_fetch_due(false, Duration::from_secs(30)));
@@ -2769,6 +3166,7 @@ mod tests {
             check_statuses: HashMap::new(),
             interrupted_pane_ids: HashSet::new(),
             sleeping_pane_ids: HashSet::new(),
+            extras: HashMap::new(),
             agents: Vec::new(),
             config_version: 0,
         }
@@ -2861,6 +3259,12 @@ mod tests {
         variants.push(changed);
         let mut changed = original.clone();
         changed.sleeping_pane_ids.insert("%1".into());
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.extras.insert(
+            "%1".into(),
+            HashMap::from([("price".into(), "$1.00".into())]),
+        );
         variants.push(changed);
         let mut changed = original.clone();
         changed.agents.push(working_agent("%1", 1));
@@ -4099,7 +4503,6 @@ mod tests {
                 boot_id: None,
                 agent_session_id: None,
                 agent_kind: None,
-                agent_session_id: None,
             };
             store.upsert_agent(&state).unwrap();
         }
@@ -4140,6 +4543,7 @@ mod tests {
                     pr_statuses: HashMap::new(),
                     check_statuses: HashMap::new(),
                     sleeping_pane_ids: HashSet::new(),
+                    extras: HashMap::new(),
                 },
                 tracker,
                 last,

@@ -50,6 +50,7 @@ sidebars without a restart.
 | `{agent_icon}`   | Per-agent icon based on the running agent's profile (see [Agent identity](#agent-identity)).                                                    |
 | `{agent_label}`  | Capitalized agent name (e.g. `Claude`, `Codex`).                                                                                                |
 | `{elapsed}`      | Elapsed time since the agent's last status change.                                                                                              |
+| `{extra:<name>}` | A value from a `sidebar.extras` command, e.g. `{extra:price}`. Empty when the extra is unconfigured or has nothing for this agent's session.    |
 | `{git_stats}`    | Composite git diff stats: committed (`+1278 -400`), pen icon, uncommitted (`+21`). Self-degrades to fit the space it gets.                      |
 | `{git_branch}`   | Current branch name. Empty when detached HEAD or git status unavailable.                                                                        |
 | `{pr_number}`    | Pull request number as `#123`. Empty when the current branch has no matching PR.                                                                |
@@ -82,6 +83,43 @@ Unknown tokens or unbalanced braces cause that template section to be rejected
 and the previous valid section (or the built-in default) is kept. The sidebar
 also shows a visible warning such as `template error: unknown token 'pr_status'
 at column 1 in tiles[0]` until the template is fixed.
+
+## External values
+
+`{extra:<name>}` renders a value produced by a command you configure. Use it to
+put anything an external tool knows about an agent session — spend, token
+counts, a queue position — next to that agent's row.
+
+```yaml
+sidebar:
+  extras:
+    price:
+      command: [opentab, cost, --batch, "-"]
+      interval_secs: 10
+```
+
+The sidebar daemon runs each command on its own interval (default 30 seconds,
+minimum 5), writes the session id of every known agent to its stdin, one per
+line, and reads back lines of `<session-id><TAB><value>`. Sessions the command
+says nothing about simply render empty, and the surrounding joiner space
+collapses with them.
+
+Values are capped at 32 characters and may not contain control characters. If
+the command fails to start, exits nonzero, or takes longer than 10 seconds, the
+previous values are kept rather than blanked — a tool reporting an incomplete
+answer should not erase a correct one.
+
+The session ids come from workmux's own agent hooks, so nothing needs to be set
+up in your multiplexer. Claude Code and Codex pipe hook JSON containing
+`session_id` into `workmux set-window-status`, which records it; the bundled
+OpenCode plugin passes `--session-id` explicitly. Agents that report no session
+id never match a row, and workmux does not fall back to guessing by worktree
+path — several agents can share one project, and the wrong answer looks exactly
+like the right one.
+
+`extras` is read from global config only. A project's `.workmux.yaml` travels
+with a cloned repository, and a checkout must not be able to choose a command
+workmux then runs.
 
 ## Layout
 

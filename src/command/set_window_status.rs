@@ -81,8 +81,8 @@ pub fn run(cmd: SetWindowStatusCommand, session_id: Option<String>) -> Result<()
     }
 
     let agent_session_id = session_id
-        .filter(|id| !id.is_empty())
-        .or_else(read_hook_session_id);
+        .or_else(read_hook_session_id)
+        .filter(|id| is_plausible_session_id(id));
 
     // Inside a sandbox guest, route through RPC to the host supervisor
     if crate::sandbox::guest::is_sandbox_guest() {
@@ -165,6 +165,13 @@ fn run_for_status_target(
     Ok(())
 }
 
+/// Whether a reported session id is worth recording. Real ids are short opaque
+/// handles (a UUID, an OpenCode `ses_…`), and this one arrives from an agent's
+/// hook payload rather than from workmux, so bound it before storing it.
+fn is_plausible_session_id(id: &str) -> bool {
+    const MAX_LEN: usize = 128;
+    !id.is_empty() && id.len() <= MAX_LEN && !id.chars().any(char::is_control)
+}
 fn apply_status_update(
     cmd: &SetWindowStatusCommand,
     config: &Config,
