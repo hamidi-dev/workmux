@@ -30,6 +30,10 @@ pub enum RpcRequest {
         /// delegated turns. The host decides whether to store it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
+        /// The agent's own session id, when the guest's hook reported one.
+        /// Defaulted so a guest running an older workmux still parses here.
+        #[serde(default)]
+        session_id: Option<String>,
     },
     SetTitle {
         title: String,
@@ -430,9 +434,11 @@ where
 fn dispatch_request(request: &RpcRequest, ctx: &RpcContext) -> RpcResponse {
     match request {
         RpcRequest::Heartbeat => RpcResponse::Ok,
-        RpcRequest::SetStatus { status, prompt } => {
-            handle_set_status(status, prompt.as_deref(), ctx)
-        }
+        RpcRequest::SetStatus {
+            status,
+            session_id,
+            prompt,
+        } => handle_set_status(status, session_id.clone(), prompt.as_deref(), ctx),
         RpcRequest::SetTitle { title } => handle_set_title(title, ctx),
         RpcRequest::SpawnAgent {
             prompt,
@@ -457,7 +463,12 @@ fn dispatch_request(request: &RpcRequest, ctx: &RpcContext) -> RpcResponse {
 
 // ── Handlers ────────────────────────────────────────────────────────────
 
-fn handle_set_status(status: &str, prompt: Option<&str>, ctx: &RpcContext) -> RpcResponse {
+fn handle_set_status(
+    status: &str,
+    session_id: Option<String>,
+    prompt: Option<&str>,
+    ctx: &RpcContext,
+) -> RpcResponse {
     let config = &ctx.config;
 
     let (agent_status, icon, auto_clear) = match status.to_lowercase().as_str() {
@@ -481,7 +492,7 @@ fn handle_set_status(status: &str, prompt: Option<&str>, ctx: &RpcContext) -> Rp
             crate::state::persist_agent_registration(
                 &*ctx.mux,
                 &ctx.pane_id,
-                None,
+                session_id,
                 crate::command::set_window_status::prompt_update(
                     config,
                     AgentStatus::Working,
@@ -525,7 +536,7 @@ fn handle_set_status(status: &str, prompt: Option<&str>, ctx: &RpcContext) -> Rp
                     &ctx.pane_id,
                     Some(agent_status),
                     None,
-                    None,
+                    session_id,
                     crate::command::set_window_status::prompt_update(config, agent_status, prompt),
                 );
             }
@@ -1080,6 +1091,7 @@ mod tests {
         let req = RpcRequest::SetStatus {
             status: "working".to_string(),
             prompt: None,
+            session_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"SetStatus\""));
@@ -1095,6 +1107,7 @@ mod tests {
         let req = RpcRequest::SetStatus {
             status: "working".to_string(),
             prompt: Some("fix the bug".to_string()),
+            session_id: Some("root-session".to_string()),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RpcRequest = serde_json::from_str(&json).unwrap();

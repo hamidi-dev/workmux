@@ -19,12 +19,20 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $, client }) => {
   const childBySession = new Map<string, boolean>();
   let reportedStatus: string | undefined;
   let pendingPrompt: string | undefined;
+  // The pane's own session is the first one this client reports. Subagents are
+  // created later and must not displace the session used for pane metadata.
+  let rootSession: string | undefined;
+  let reportedSession: string | undefined;
   let statusQueue = Promise.resolve();
 
   function writeStatus(status: string, prompt?: string) {
-    const command = prompt === undefined
-      ? $`workmux set-window-status ${status}`
-      : $`workmux set-window-status ${status} < ${new Response(JSON.stringify({ prompt }))}`;
+    // An explicit --session-id deliberately skips stdin. Send both fields in
+    // the hook payload when a prompt needs to travel with the identity.
+    const command = prompt !== undefined
+      ? $`workmux set-window-status ${status} < ${new Response(JSON.stringify({ prompt, session_id: rootSession }))}`
+      : rootSession
+        ? $`workmux set-window-status ${status} --session-id ${rootSession}`
+        : $`workmux set-window-status ${status}`;
     return command.quiet().then(() => {}, () => {});
   }
 
@@ -75,11 +83,12 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $, client }) => {
       status = 'working';
     }
 
-    if (reportedStatus === status && !(status === 'working' && pendingPrompt !== undefined)) {
+    if (reportedStatus === status && reportedSession === rootSession && !(status === 'working' && pendingPrompt !== undefined)) {
       return;
     }
 
     reportedStatus = status;
+    reportedSession = rootSession;
     await queueStatus(status, takePrompt(status));
   }
 
@@ -90,6 +99,8 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $, client }) => {
     if (!sessionID || deletedSessions.has(sessionID)) {
       return;
     }
+
+    rootSession ??= sessionID;
 
     const previous = statusBySession.get(sessionID);
     if (status === 'done' && previous === undefined) {
@@ -164,7 +175,13 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $, client }) => {
           deletedSessions.add(sessionID);
           acceptBusyBySession.delete(sessionID);
           childBySession.delete(sessionID);
-          if (statusBySession.delete(sessionID)) {
+          const tracked = statusBySession.delete(sessionID);
+          // Losing the root session frees the slot: whatever this client works
+          // on next is the pane's session now.
+          if (rootSession === sessionID) {
+            rootSession = undefined;
+          }
+          if (tracked) {
             await reportAggregateStatus();
           }
           break;
