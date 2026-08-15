@@ -1,6 +1,7 @@
 //! Per-row context: pre-computed token values for a single agent row.
 
 use ratatui::style::{Color, Modifier, Style};
+use std::collections::HashMap;
 
 use crate::agent_display::{extract_project_name, extract_worktree_name, sanitize_pane_title};
 use crate::agent_identity::AgentKind;
@@ -24,6 +25,8 @@ pub struct RowContext<'a> {
     pub pane_suffix: String,
     /// Compact elapsed string (e.g. "5:23", "2h", "1d").
     pub elapsed: String,
+    /// External values for this pane, keyed by `sidebar.extras` name.
+    pub extras: HashMap<String, String>,
     /// Status icon parsed into styled spans.
     pub status_icon_spans: Vec<(String, Style)>,
     /// Foreground color extracted from status icon style.
@@ -92,6 +95,7 @@ impl<'a> RowContext<'a> {
             .status_ts
             .map(|ts| format_compact_elapsed(now_secs.saturating_sub(ts)))
             .unwrap_or_default();
+        let extras = app.extras.get(&agent.pane_id).cloned().unwrap_or_default();
 
         let pane_title = build_pane_title(agent, &primary, &secondary, app.window_prefix());
         let git_status = app.git_statuses.get(&agent.path);
@@ -109,6 +113,7 @@ impl<'a> RowContext<'a> {
             secondary,
             pane_suffix,
             elapsed,
+            extras,
             status_icon_spans,
             status_color,
             pane_title,
@@ -125,6 +130,30 @@ impl<'a> RowContext<'a> {
             idx,
             spinner_frame: app.spinner_frame,
         }
+    }
+
+    /// Resolve an `{extra:<name>}` token. An extra that is not configured, or
+    /// that had nothing to say about this agent's session, renders empty.
+    pub fn resolve_extra(&self, name: &str) -> String {
+        self.extras.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Natural display width of an `{extra:<name>}` token.
+    pub fn extra_width(&self, name: &str) -> usize {
+        self.extras
+            .get(name)
+            .map(|value| display_width(value))
+            .unwrap_or(0)
+    }
+
+    /// Intrinsic style for an `{extra:<name>}` token.
+    pub fn extra_style(&self) -> Style {
+        if self.is_stale {
+            return Style::default()
+                .fg(self.palette.dimmed)
+                .add_modifier(Modifier::DIM);
+        }
+        Style::default().fg(self.palette.accent)
     }
 
     /// Resolve a token to its display string.
@@ -650,6 +679,7 @@ mod tests {
             secondary: String::new(),
             pane_suffix: String::new(),
             elapsed: String::new(),
+            extras: HashMap::new(),
             status_icon_spans: vec![],
             status_color: Color::Reset,
             pane_title: None,
@@ -748,6 +778,17 @@ mod tests {
             make_context(&agent, None, 0).resolve(TokenId::StatusLabel),
             ""
         );
+    }
+
+    #[test]
+    fn resolve_extra_by_name() {
+        let agent = test_agent();
+        let mut ctx = make_context(&agent, None, 0);
+        ctx.extras.insert("price".to_string(), "~$0.42".to_string());
+
+        assert_eq!(ctx.resolve_extra("price"), "~$0.42");
+        assert_eq!(ctx.extra_width("price"), 6);
+        assert_eq!(ctx.resolve_extra("unconfigured"), "");
     }
 
     #[test]

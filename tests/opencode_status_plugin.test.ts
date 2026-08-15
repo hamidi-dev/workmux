@@ -34,6 +34,11 @@ const userMessage = (sessionID: string) => ({
   properties: { sessionID, info: { role: 'user', sessionID } },
 });
 
+const sessionCreated = (id: string, parentID?: string) => ({
+  type: 'session.created',
+  properties: { info: { id, ...(parentID ? { parentID } : {}) } },
+});
+
 describe('WorkmuxStatusPlugin', () => {
   test('stays working when a child session finishes before its parent', async () => {
     const harness = await createHarness();
@@ -135,6 +140,102 @@ describe('WorkmuxStatusPlugin', () => {
 
     expect(harness.commands.at(-1)).toBe(
       'workmux set-window-status working --session-id second',
+    );
+  });
+
+  test('a surviving child never inherits the deleted root session', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionStatus('parent', 'busy'));
+    await harness.emit(sessionStatus('child', 'busy'));
+    await harness.emit({
+      type: 'session.deleted',
+      properties: { info: { id: 'parent' } },
+    });
+    await harness.emit(sessionStatus('child', 'idle'));
+
+    expect(harness.commands.some((c) => c.includes('--session-id child'))).toBe(
+      false,
+    );
+
+    // A session started after the deletion is a new conversation, not a
+    // descendant, so it does take the free slot.
+    await harness.emit(sessionStatus('successor', 'busy'));
+    expect(harness.commands.at(-1)).toBe(
+      'workmux set-window-status working --session-id successor',
+    );
+  });
+
+  test('follows a new session started next to the old one', async () => {
+    const harness = await createHarness();
+
+    // `/new` does not delete the session it replaces, so the pane has to
+    // follow the created one or it reports the old conversation forever.
+    await harness.emit(sessionStatus('first', 'busy'));
+    await harness.emit(sessionStatus('first', 'idle'));
+    await harness.emit(sessionCreated('second'));
+
+    expect(harness.commands.at(-1)).toBe(
+      'workmux set-window-status done --session-id second',
+    );
+
+    await harness.emit(userMessage('second'));
+    await harness.emit(sessionStatus('second', 'busy'));
+    expect(harness.commands.at(-1)).toBe(
+      'workmux set-window-status working --session-id second',
+    );
+  });
+
+  test('a trailing event from the replaced session does not take the pane back', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionStatus('first', 'busy'));
+    await harness.emit(sessionCreated('second'));
+    await harness.emit(sessionStatus('first', 'idle'));
+
+    expect(harness.commands.at(-1)).toBe(
+      'workmux set-window-status done --session-id second',
+    );
+  });
+
+  test('a subagent session never takes the pane, not even on its own message', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionCreated('parent'));
+    await harness.emit(sessionStatus('parent', 'busy'));
+    await harness.emit(sessionCreated('child', 'parent'));
+    await harness.emit(userMessage('child'));
+    await harness.emit(sessionStatus('child', 'busy'));
+    await harness.emit(sessionStatus('child', 'idle'));
+    await harness.emit(sessionStatus('parent', 'idle'));
+
+    expect(harness.commands.every((c) => !c.includes('--session-id child'))).toBe(
+      true,
+    );
+    expect(harness.commands.at(-1)).toBe(
+      'workmux set-window-status done --session-id parent',
+    );
+  });
+
+  test('follows the session the user switches back to', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionCreated('first'));
+    await harness.emit(sessionStatus('first', 'busy'));
+    await harness.emit(sessionStatus('first', 'idle'));
+    await harness.emit(sessionCreated('second'));
+    await harness.emit(sessionStatus('second', 'busy'));
+    await harness.emit(sessionStatus('second', 'idle'));
+
+    // Switching sessions creates nothing -- the next prompt is the signal.
+    await harness.emit(userMessage('first'));
+    expect(harness.commands.at(-1)).toBe(
+      'workmux set-window-status done --session-id first',
+    );
+
+    await harness.emit(sessionStatus('first', 'busy'));
+    expect(harness.commands.at(-1)).toBe(
+      'workmux set-window-status working --session-id first',
     );
   });
 

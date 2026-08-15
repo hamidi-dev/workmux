@@ -89,6 +89,15 @@ const DEFAULT_GLOBAL_CONFIG: &str = r#"# workmux global configuration
 # merge_strategy: rebase
 # merge_keep: true
 #
+# sidebar:
+#   # External per-agent values, shown with {extra:<name>} in sidebar templates.
+#   # The command receives one agent session id per line on stdin and prints
+#   # "<session-id><TAB><value>" for the ones it knows about.
+#   extras:
+#     price:
+#       command: [opentab, cost, --batch, "-"]
+#       interval_secs: 10
+#
 # panes:
 #   - command: <agent>
 #     focus: true

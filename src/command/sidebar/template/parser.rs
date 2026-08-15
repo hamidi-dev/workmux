@@ -2,6 +2,9 @@
 
 use std::fmt;
 
+/// Prefix marking a template token as an external value: `{extra:<name>}`.
+pub const EXTRA_TOKEN_PREFIX: &str = "extra:";
+
 /// A single token in a parsed template line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
@@ -9,6 +12,10 @@ pub enum Token {
     Literal(String),
     /// A named field token.
     Field(TokenId),
+    /// An external value produced by a `sidebar.extras` command, by name.
+    /// Unconfigured names render empty rather than erroring, so a template
+    /// shared between machines degrades instead of breaking.
+    Extra(String),
     /// Layout fill marker.
     Fill,
     /// Tmux-style directive (`#[fg=red,bold]`). Carries the raw directive
@@ -119,6 +126,7 @@ impl std::error::Error for ParseError {}
 /// - `{{` → literal `{`
 /// - `}}` → literal `}`
 /// - `{name}` → field token
+/// - `{extra:name}` → external value token
 /// - `{fill}` → fill marker
 /// - `#[fg=red,bold]` → tmux-style directive token (zero-width). Unclosed
 ///   `#[...` falls back to literal text.
@@ -211,6 +219,18 @@ pub fn parse_line(input: &str) -> Result<Vec<Token>, ParseError> {
             if name == "fill" {
                 tokens.push(Token::Fill);
                 fill_count += 1;
+            } else if let Some(extra) = name.strip_prefix(EXTRA_TOKEN_PREFIX) {
+                if !crate::config::is_valid_extra_name(extra) {
+                    return Err(ParseError {
+                        message: format!(
+                            "invalid extra name '{}' at column {} (lowercase letters, \
+                             digits and underscores only)",
+                            extra,
+                            start + 1
+                        ),
+                    });
+                }
+                tokens.push(Token::Extra(extra.to_string()));
             } else {
                 let token_id = match name.as_str() {
                     "status_icon" => TokenId::StatusIcon,
@@ -346,6 +366,32 @@ mod tests {
     fn reject_unknown_token() {
         let err = parse_line("{unknown}").unwrap_err();
         assert!(err.message.contains("unknown token 'unknown'"));
+    }
+
+    #[test]
+    fn parse_extra_token_by_name() {
+        assert_eq!(
+            parse_line("{primary} {extra:price}").unwrap(),
+            vec![
+                Token::Field(TokenId::Primary),
+                Token::Literal(" ".to_string()),
+                Token::Extra("price".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reject_extra_token_with_an_unusable_name() {
+        // Rejected at parse time rather than silently rendering empty: an
+        // unusable name can never match a config key, so it is always a typo.
+        for name in ["{extra:}", "{extra:Price}", "{extra:a b}", "{extra:a:b}"] {
+            let err = parse_line(name).unwrap_err();
+            assert!(
+                err.message.contains("invalid extra name"),
+                "expected a name error for {name}, got {}",
+                err.message
+            );
+        }
     }
 
     #[test]

@@ -86,11 +86,15 @@ pub fn persist_agent_update(
     // Capture existing agent_kind before `existing` is consumed below.
     let existing_agent_kind = existing.as_ref().and_then(|e| e.agent_kind.clone());
 
-    // A caller that knows the agent's session id wins; otherwise keep what was
-    // recorded. Hooks that fire without one (a plain `set-window-status done`)
-    // must not erase an id an earlier event already established.
-    let agent_session_id =
-        agent_session_id.or_else(|| existing.as_ref().and_then(|e| e.agent_session_id.clone()));
+    let pane_holds_same_process = existing.as_ref().is_some_and(|e| {
+        e.pane_pid == live_info.pid.unwrap_or(0)
+            && Some(e.command.as_str()) == live_info.current_command.as_deref()
+    });
+    let agent_session_id = merge_agent_session_id(
+        agent_session_id,
+        existing.as_ref().and_then(|e| e.agent_session_id.clone()),
+        pane_holds_same_process,
+    );
 
     // Snapshot the live title for classification before the resolved
     // `pane_title` consumes `live_info.title`.
@@ -153,6 +157,21 @@ fn merge_agent_kind(new: Option<String>, existing: Option<String>) -> Option<Str
     existing.or(new)
 }
 
+/// Resolve which agent session id to store for this update.
+///
+/// A reported id wins; otherwise the stored one is kept, but only while the
+/// pane still holds the process it was recorded against. Reconcile removes a
+/// recycled pane's state, but a hook can land first, and inheriting across
+/// that boundary would show the previous agent's values on the new agent's
+/// row. Dropping it costs one update -- the agent reports its id again.
+fn merge_agent_session_id(
+    reported: Option<String>,
+    existing: Option<String>,
+    pane_holds_same_process: bool,
+) -> Option<String> {
+    reported.or_else(|| pane_holds_same_process.then_some(existing)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +193,32 @@ mod tests {
     #[test]
     fn merge_returns_none_when_both_none() {
         assert_eq!(merge_agent_kind(None, None), None);
+    }
+
+    #[test]
+    fn reported_session_id_always_wins() {
+        assert_eq!(
+            merge_agent_session_id(Some("new".into()), Some("old".into()), true),
+            Some("new".into())
+        );
+    }
+
+    #[test]
+    fn session_id_survives_an_update_that_carries_none() {
+        assert_eq!(
+            merge_agent_session_id(None, Some("ses_a".into()), true),
+            Some("ses_a".into())
+        );
+    }
+
+    #[test]
+    fn session_id_is_dropped_when_the_pane_changed_hands() {
+        // A recycled pane whose new agent has not reported an id yet must show
+        // no value, not the previous agent's.
+        assert_eq!(
+            merge_agent_session_id(None, Some("ses_a".into()), false),
+            None
+        );
     }
 
     #[test]
