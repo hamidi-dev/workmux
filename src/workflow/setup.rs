@@ -20,74 +20,43 @@ pub fn resolve_window_placement_target(
     mux.resolve_window_placement_target(config.window_placement())
 }
 
-/// Sets up the terminal window, files, and hooks for a worktree.
-/// This is the shared logic between `create` and `open`.
-///
-/// # Arguments
-/// * `mux` - The terminal multiplexer backend
-/// * `branch_name` - The git branch name (for logging/reference)
-/// * `handle` - The display name used for window naming
-/// * `worktree_path` - Path to the worktree directory
-/// * `config` - Configuration settings
-/// * `options` - Setup options (hooks, file ops, etc.)
-/// * `agent` - Optional agent override
-/// * `after_window` - Optional window ID to insert after (for grouping duplicates)
-#[allow(clippy::too_many_arguments)]
-pub fn setup_environment(
-    mux: &dyn Multiplexer,
+pub struct ProvisionedEnvironment {
+    pub working_directory: PathBuf,
+    pub post_create_hooks_run: usize,
+}
+
+pub fn provision_environment(
     branch_name: &str,
     handle: &str,
     worktree_path: &Path,
     config: &config::Config,
     options: &super::types::SetupOptions,
-    agent: Option<&str>,
-    after_window: Option<String>,
-) -> Result<CreateResult> {
-    debug!(
-        branch = branch_name,
-        handle = handle,
-        path = %worktree_path.display(),
-        run_hooks = options.run_hooks,
-        run_file_ops = options.run_file_ops,
-        "setup_environment:start"
-    );
-    let prefix = config.window_prefix();
+    hook_output: cmd::ShellOutput,
+) -> Result<ProvisionedEnvironment> {
     let repo_root = match &options.config_root {
         Some(path) => path.clone(),
         None => git::get_main_worktree_root()?,
     };
-
-    // Determine effective working directory (config-relative or worktree root)
     let effective_working_dir = options.working_dir.as_deref().unwrap_or(worktree_path);
-
-    // Determine source root for file operations
     let file_ops_source = options.config_root.as_deref().unwrap_or(&repo_root);
 
-    // Perform file operations (copy and symlink) if requested
     if options.run_file_ops {
         handle_file_operations(file_ops_source, effective_working_dir, &config.files)
             .context("Failed to perform file operations")?;
+        symlink_claude_local_md(&repo_root, effective_working_dir)
+            .context("Failed to auto-symlink CLAUDE.local.md")?;
         debug!(
             branch = branch_name,
-            "setup_environment:file operations applied"
+            "provision_environment:file operations applied"
         );
     }
 
-    // Auto-symlink CLAUDE.local.md from main worktree if it exists and is gitignored
-    if options.run_file_ops {
-        symlink_claude_local_md(&repo_root, effective_working_dir)
-            .context("Failed to auto-symlink CLAUDE.local.md")?;
-    }
-
-    // Run post-create hooks before opening tmux so the new window appears "ready"
     let mut hooks_run = 0;
     if options.run_hooks
         && let Some(post_create) = &config.post_create
         && !post_create.is_empty()
     {
         hooks_run = post_create.len();
-        // Resolve absolute paths for environment variables.
-        // canonicalize() ensures symlinks are resolved and paths are absolute.
         let abs_worktree_path = worktree_path
             .canonicalize()
             .unwrap_or_else(|_| worktree_path.to_path_buf());
@@ -108,23 +77,56 @@ pub fn setup_environment(
             ("WM_CONFIG_DIR", config_dir_str.as_ref()),
         ];
         for (idx, command) in post_create.iter().enumerate() {
-            info!(branch = branch_name, step = idx + 1, total = hooks_run, command = %command, "setup_environment:hook start");
-            info!(command = %command, "Running post-create hook {}/{}", idx + 1, hooks_run);
-            cmd::shell_command_with_env(
+            info!(branch = branch_name, step = idx + 1, total = hooks_run, command = %command, "provision_environment:hook start");
+            cmd::shell_command_with_env_mode(
                 config.hook_shell.as_deref(),
                 command,
                 effective_working_dir,
                 &hook_env,
+                hook_output,
             )
             .with_context(|| format!("Failed to run post-create command: '{}'", command))?;
-            info!(branch = branch_name, step = idx + 1, total = hooks_run, command = %command, "setup_environment:hook complete");
+            info!(branch = branch_name, step = idx + 1, total = hooks_run, command = %command, "provision_environment:hook complete");
         }
-        info!(
-            branch = branch_name,
-            total = hooks_run,
-            "setup_environment:hooks complete"
-        );
     }
+
+    Ok(ProvisionedEnvironment {
+        working_directory: effective_working_dir.to_path_buf(),
+        post_create_hooks_run: hooks_run,
+    })
+}
+
+/// Sets up files, hooks, and a multiplexer target for a worktree.
+#[allow(clippy::too_many_arguments)]
+pub fn setup_environment(
+    mux: &dyn Multiplexer,
+    branch_name: &str,
+    handle: &str,
+    worktree_path: &Path,
+    config: &config::Config,
+    options: &super::types::SetupOptions,
+    agent: Option<&str>,
+    after_window: Option<String>,
+) -> Result<CreateResult> {
+    debug!(
+        branch = branch_name,
+        handle = handle,
+        path = %worktree_path.display(),
+        run_hooks = options.run_hooks,
+        run_file_ops = options.run_file_ops,
+        "setup_environment:start"
+    );
+    let prefix = config.window_prefix();
+    let provisioned = provision_environment(
+        branch_name,
+        handle,
+        worktree_path,
+        config,
+        options,
+        cmd::ShellOutput::Inherit,
+    )?;
+    let effective_working_dir = provisioned.working_directory.as_path();
+    let hooks_run = provisioned.post_create_hooks_run;
 
     // Build window plans: normalize windows/panes config into a list of window configs.
     // In window mode, we always use a single window from panes config.

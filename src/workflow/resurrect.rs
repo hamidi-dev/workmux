@@ -110,6 +110,9 @@ pub fn plan(store: &StateStore, mux: &dyn Multiplexer) -> Result<ResurrectPlan> 
             .find(|(canon_wt, _)| canon_agent == *canon_wt || canon_agent.starts_with(canon_wt));
 
         match matched {
+            Some((_canon_wt, handle)) if !git::get_worktree_attachment(handle).manages_mux() => {
+                unmatched_states += 1;
+            }
             Some((_canon_wt, handle)) => {
                 info!(
                     pane_id = %agent.pane_key.pane_id,

@@ -61,6 +61,7 @@ pub fn open(
         .to_string_lossy()
         .to_string();
 
+    let attachment = git::get_worktree_attachment_in(&base_handle, Some(&context.execution_dir));
     // Resolve mode using canonical base_handle (not the CLI-provided name which may be a branch).
     // Precedence: CLI override > stored git metadata > config default (from options.mode)
     let stored_mode = git::get_worktree_mode_opt_in(&base_handle, Some(&context.execution_dir));
@@ -123,7 +124,7 @@ pub fn open(
         }
     }
 
-    if prior_mode != mode {
+    if attachment.manages_mux() && prior_mode != mode {
         match prior_mode {
             MuxMode::Window => {
                 let window_token = context
@@ -263,7 +264,9 @@ pub fn open(
                 .map(|owned| owned.target.clone())
         });
     let window_target = owned_primary.unwrap_or(fallback_window_target);
-    let target_exists = if mode == MuxMode::Window {
+    let target_exists = if !attachment.manages_mux() {
+        false
+    } else if mode == MuxMode::Window {
         if window_token.is_some() && window_target.window_id.is_none() {
             false
         } else {
@@ -451,6 +454,11 @@ pub fn open(
         &options_with_workdir,
         agent,
         None,
+    )?;
+    git::set_worktree_attachment_in(
+        &base_handle,
+        git::WorktreeAttachment::Multiplexer,
+        Some(&context.execution_dir),
     )?;
     info!(
         handle = handle,

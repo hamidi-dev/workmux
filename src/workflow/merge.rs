@@ -66,8 +66,9 @@ pub fn merge(
             )
         })?;
 
-    // Capture mode BEFORE cleanup (cleanup removes the metadata)
+    // Capture metadata before cleanup removes it.
     let mode = get_worktree_mode(handle);
+    let attachment = git::get_worktree_attachment_in(handle, Some(&context.execution_dir));
 
     debug!(
         name = name,
@@ -361,15 +362,19 @@ pub fn merge(
     };
 
     let cleanup_scheduled = cleanup_result.deferred_cleanup.is_some();
-    let cleanup_error = cleanup::navigate_to_target_and_close(
-        context.mux.as_ref(),
-        &context.prefix,
-        &target_window_name,
-        handle,
-        &cleanup_result,
-        mode,
-    )
-    .err();
+    let cleanup_error = if attachment.manages_mux() {
+        cleanup::navigate_to_target_and_close(
+            context.mux.as_ref(),
+            &context.prefix,
+            &target_window_name,
+            handle,
+            &cleanup_result,
+            mode,
+        )
+        .err()
+    } else {
+        None
+    };
 
     Ok(MergeResult {
         branch_merged: branch_to_merge,

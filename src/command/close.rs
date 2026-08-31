@@ -38,6 +38,13 @@ pub fn run(name: Option<&str>) -> Result<()> {
         }
     };
 
+    if !git::get_worktree_attachment(&resolved_handle).manages_mux() {
+        return Err(anyhow!(
+            "Worktree '{}' has no workmux-managed multiplexer target",
+            resolved_handle
+        ));
+    }
+
     // Determine if this worktree was created as a session or window
     let mode = git::get_worktree_mode(&resolved_handle);
     let target_name = if mode == crate::config::MuxMode::Session {

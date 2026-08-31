@@ -7,6 +7,20 @@ use crate::config::MuxMode;
 use super::WorktreeNotFound;
 use super::branch::unset_branch_upstream_in;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorktreeAttachment {
+    Headless,
+    Multiplexer,
+    Legacy,
+    Unknown,
+}
+
+impl WorktreeAttachment {
+    pub fn manages_mux(self) -> bool {
+        matches!(self, Self::Multiplexer | Self::Legacy)
+    }
+}
+
 /// Check if a worktree already exists for a branch
 #[allow(dead_code)]
 pub fn worktree_exists(branch_name: &str) -> Result<bool> {
@@ -345,6 +359,34 @@ pub fn get_worktree_meta_in(handle: &str, key: &str, workdir: Option<&Path>) -> 
         None => cmd,
     };
     cmd.run_and_capture_stdout().ok().filter(|s| !s.is_empty())
+}
+
+pub fn get_worktree_attachment(handle: &str) -> WorktreeAttachment {
+    get_worktree_attachment_in(handle, None)
+}
+
+pub fn get_worktree_attachment_in(handle: &str, workdir: Option<&Path>) -> WorktreeAttachment {
+    match get_worktree_meta_in(handle, "attachment", workdir).as_deref() {
+        Some("headless") => WorktreeAttachment::Headless,
+        Some("multiplexer") => WorktreeAttachment::Multiplexer,
+        Some(_) => WorktreeAttachment::Unknown,
+        None => WorktreeAttachment::Legacy,
+    }
+}
+
+pub fn set_worktree_attachment_in(
+    handle: &str,
+    attachment: WorktreeAttachment,
+    workdir: Option<&Path>,
+) -> Result<()> {
+    let value = match attachment {
+        WorktreeAttachment::Headless => "headless",
+        WorktreeAttachment::Multiplexer => "multiplexer",
+        WorktreeAttachment::Legacy | WorktreeAttachment::Unknown => {
+            return Err(anyhow!("Only explicit attachment state can be persisted"));
+        }
+    };
+    set_worktree_meta_in(handle, "attachment", value, workdir)
 }
 
 pub fn get_worktree_window_token(handle: &str) -> Option<String> {

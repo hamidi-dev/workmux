@@ -94,8 +94,9 @@ fn remove_with_hook_output(
 
     debug!(handle = actual_handle, branch = branch_name, path = %worktree_path.display(), "remove:worktree resolved");
 
-    // Capture mode BEFORE cleanup (cleanup removes the metadata)
+    // Capture metadata before cleanup removes it.
     let mode = get_worktree_mode(actual_handle);
+    let attachment = git::get_worktree_attachment_in(actual_handle, Some(&context.execution_dir));
 
     // Safety Check: Prevent deleting the main worktree itself, regardless of branch.
     if context.is_main_worktree(&worktree_path) {
@@ -157,15 +158,16 @@ fn remove_with_hook_output(
         },
     )?;
 
-    // Navigate to the main branch window/session and close the source
-    cleanup::navigate_to_target_and_close(
-        context.mux.as_ref(),
-        &context.prefix,
-        &context.main_branch,
-        actual_handle,
-        &cleanup_result,
-        mode,
-    )?;
+    if attachment.manages_mux() {
+        cleanup::navigate_to_target_and_close(
+            context.mux.as_ref(),
+            &context.prefix,
+            &context.main_branch,
+            actual_handle,
+            &cleanup_result,
+            mode,
+        )?;
+    }
 
     let cleanup_scheduled = cleanup_result.deferred_cleanup.is_some();
     if cleanup_scheduled && show_hook_output {

@@ -439,6 +439,27 @@ pub fn cleanup(
     worktree_path: &Path,
     options: CleanupOptions,
 ) -> Result<CleanupResult> {
+    cleanup_impl(context, branch_name, handle, worktree_path, options, false)
+}
+
+pub fn cleanup_headless(
+    context: &WorkflowContext,
+    branch_name: &str,
+    handle: &str,
+    worktree_path: &Path,
+    options: CleanupOptions,
+) -> Result<CleanupResult> {
+    cleanup_impl(context, branch_name, handle, worktree_path, options, true)
+}
+
+fn cleanup_impl(
+    context: &WorkflowContext,
+    branch_name: &str,
+    handle: &str,
+    worktree_path: &Path,
+    options: CleanupOptions,
+    force_headless: bool,
+) -> Result<CleanupResult> {
     let CleanupOptions {
         force,
         keep_branch,
@@ -469,6 +490,42 @@ pub fn cleanup(
             }
             Err(error) => return Err(error),
         };
+
+    if force_headless
+        || !git::get_worktree_attachment_in(handle, Some(&context.execution_dir)).manages_mux()
+    {
+        info!(branch = branch_name, handle, path = %worktree_path.display(), "cleanup:headless");
+        context.chdir_to_main_worktree()?;
+        if worktree_path.exists() && !no_hooks {
+            run_pre_remove_hooks(
+                context,
+                handle,
+                worktree_path,
+                branch_name,
+                show_hook_output,
+            )?;
+        }
+        cleanup_prompt_files(branch_name);
+        let quarantine_identity = expected_identity
+            .as_ref()
+            .map(QuarantineIdentity::repository)
+            .or_else(|| missing_admin_identity.map(QuarantineIdentity::directory));
+        perform_destructive_cleanup(
+            worktree_path,
+            quarantine_identity,
+            branch_name,
+            handle,
+            keep_branch,
+            force,
+            &context.git_common_dir,
+        )?;
+        return Ok(CleanupResult {
+            tmux_window_killed: false,
+            source_target_is_active: false,
+            source_target_to_close: None,
+            deferred_cleanup: None,
+        });
+    }
 
     // Determine if this worktree was created as a session or window
     let mode = get_worktree_mode(handle);

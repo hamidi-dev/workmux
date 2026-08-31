@@ -143,6 +143,7 @@ pub fn list_in(
     let target_sessions = git::get_all_worktree_meta_key_in(repo, "target-session");
     let window_sessions = git::get_all_worktree_meta_key_in(repo, "window-session");
     let window_tokens = git::get_all_worktree_meta_key_in(repo, "window-token");
+    let attachments = git::get_all_worktree_meta_key_in(repo, "attachment");
     let active_window_tokens = if mux_running {
         mux.owned_window_tokens().unwrap_or_default()
     } else {
@@ -176,7 +177,12 @@ pub fn list_in(
                 target_windows.get(&handle).unwrap_or(&handle)
             };
             let prefixed_name = util::prefixed(prefix, target_name);
-            let has_mux_window = if mode == MuxMode::Session {
+            let has_mux_window = if attachments
+                .get(&handle)
+                .is_some_and(|value| value != "multiplexer")
+            {
+                false
+            } else if mode == MuxMode::Session {
                 mux_sessions.contains(&prefixed_name)
             } else if mux.supports_window_ownership() && window_tokens.contains_key(&handle) {
                 window_tokens.get(&handle).is_some_and(|token| {

@@ -33,10 +33,41 @@ fn is_registered_worktree(path: &Path, context: &WorkflowContext) -> Result<bool
 use super::cleanup;
 use super::context::WorkflowContext;
 use super::setup;
-use super::types::{CreateArgs, CreateResult, SetupOptions};
+use super::types::{CreateArgs, CreateResult, ProvisionResult, SetupOptions};
 
-/// Create a new worktree with tmux window and panes
+enum CreateOutcome {
+    Attached(CreateResult),
+    Provisioned(ProvisionResult),
+}
+
+/// Create a new worktree with a multiplexer target.
 pub fn create(context: &WorkflowContext, args: CreateArgs) -> Result<CreateResult> {
+    match create_impl(context, args, false, false)? {
+        CreateOutcome::Attached(result) => Ok(result),
+        CreateOutcome::Provisioned(_) => {
+            unreachable!("attached creation returned provision result")
+        }
+    }
+}
+
+/// Create a new worktree without reading or creating multiplexer state.
+pub fn create_headless(
+    context: &WorkflowContext,
+    args: CreateArgs,
+    json_output: bool,
+) -> Result<ProvisionResult> {
+    match create_impl(context, args, true, json_output)? {
+        CreateOutcome::Provisioned(result) => Ok(result),
+        CreateOutcome::Attached(_) => unreachable!("headless creation returned attached result"),
+    }
+}
+
+fn create_impl(
+    context: &WorkflowContext,
+    args: CreateArgs,
+    headless: bool,
+    json_output: bool,
+) -> Result<CreateOutcome> {
     let CreateArgs {
         branch_name,
         handle,
@@ -60,162 +91,138 @@ pub fn create(context: &WorkflowContext, args: CreateArgs) -> Result<CreateResul
         "create:start"
     );
 
-    // Validate layout config before any other operations
-    if context.config.panes.is_some() && context.config.windows.is_some() {
-        anyhow::bail!("Cannot specify both 'panes' and 'windows' in configuration.");
-    }
-    if let Some(windows) = &context.config.windows {
-        if options.mode != MuxMode::Session {
-            anyhow::bail!(
-                "'windows' configuration requires 'mode: session'. \
-                 Either add 'mode: session' to your config or use --session flag."
-            );
-        }
-        crate::config::validate_windows_config(windows)?;
-    }
-    if let Some(panes) = &context.config.panes {
-        crate::config::validate_panes_config(panes)?;
-    }
-
-    // Pre-flight checks
-    context.ensure_mux_running()?;
-
-    let placement_window_id =
-        if options.mode == MuxMode::Window && options.window_session_name.is_none() {
-            setup::resolve_window_placement_target(context.mux.as_ref(), &context.config)?
-        } else {
-            None
-        };
-
-    // Validate backend supports session mode before creating any git state
-    if options.mode == MuxMode::Session && context.mux.name() != "tmux" {
-        return Err(anyhow!(
-            "Session mode (--mode session / --session) is only supported with tmux.\n\
-             Current backend: {}. Use window mode instead.",
-            context.mux.name()
-        ));
-    }
-
-    // Check if worktree or target (window/session) already exists
-    let requested_target_name = options.primary_mux_target_name(handle);
-    let explicit_target_name = options.has_explicit_primary_mux_target();
-    let target = MuxHandle::new(
-        context.mux.as_ref(),
-        options.mode,
-        &context.prefix,
-        requested_target_name,
-    );
-    let full_target_name = target.full_name();
-    let mut target_exists = target.exists()?;
     let worktree_exists = git::worktree_exists_in(branch_name, Some(&context.execution_dir))?;
-
-    // Detect cross-repo collision: mux target exists but local worktree does not.
-    // This means the target belongs to a different repository. Auto-suffix with the
-    // project directory name to avoid the collision. We use a non-numeric suffix so
-    // cleanup's `find_matching_windows` regex (base(-\d+)?) won't confuse it with
-    // `open --new` duplicates.
     let mut current_handle = handle.to_string();
-    let mut current_target_name = requested_target_name.to_string();
-    if target_exists && !worktree_exists && !is_explicit_name && !explicit_target_name {
-        let project_name = context
-            .main_worktree_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("repo");
-        let mut project_slug = slug::slugify(project_name);
-        // Guard against empty slugs (e.g., project dir "___") and purely numeric
-        // slugs (e.g., "123") which would match cleanup's `base(-\d+)?` regex and
-        // cause `wm rm` in one repo to kill the other repo's window.
-        if project_slug.is_empty() || project_slug.chars().all(|c| c.is_ascii_digit()) {
-            project_slug = format!(
-                "repo-{}",
-                if project_slug.is_empty() {
-                    "unnamed"
-                } else {
-                    &project_slug
-                }
-            );
-        }
-        current_handle = format!("{}-{}", handle, project_slug);
-        current_target_name = current_handle.clone();
+    let mut placement_window_id = None;
 
-        let suffixed_target = MuxHandle::new(
+    if !headless {
+        if context.config.panes.is_some() && context.config.windows.is_some() {
+            anyhow::bail!("Cannot specify both 'panes' and 'windows' in configuration.");
+        }
+        if let Some(windows) = &context.config.windows {
+            if options.mode != MuxMode::Session {
+                anyhow::bail!(
+                    "'windows' configuration requires 'mode: session'. \
+                     Either add 'mode: session' to your config or use --session flag."
+                );
+            }
+            crate::config::validate_windows_config(windows)?;
+        }
+        if let Some(panes) = &context.config.panes {
+            crate::config::validate_panes_config(panes)?;
+        }
+
+        context.ensure_mux_running()?;
+        if options.mode == MuxMode::Window && options.window_session_name.is_none() {
+            placement_window_id =
+                setup::resolve_window_placement_target(context.mux.as_ref(), &context.config)?;
+        }
+        if options.mode == MuxMode::Session && context.mux.name() != "tmux" {
+            return Err(anyhow!(
+                "Session mode (--mode session / --session) is only supported with tmux.\n\
+                 Current backend: {}. Use window mode instead.",
+                context.mux.name()
+            ));
+        }
+
+        let requested_target_name = options.primary_mux_target_name(handle);
+        let explicit_target_name = options.has_explicit_primary_mux_target();
+        let target = MuxHandle::new(
             context.mux.as_ref(),
             options.mode,
             &context.prefix,
-            &current_target_name,
+            requested_target_name,
         );
-
-        eprintln!(
-            "workmux: {} '{}' exists in another repository, using '{}'",
-            target.kind(),
-            full_target_name,
-            suffixed_target.full_name()
-        );
-
-        target_exists = suffixed_target.exists()?;
-    }
-
-    // If open_if_exists is set and either exists, delegate to open workflow
-    if options.open_if_exists && (target_exists || worktree_exists) {
-        debug!(
-            branch = branch_name,
-            handle = handle,
-            target_exists,
-            worktree_exists,
-            "create:delegating to open (open_if_exists=true)"
-        );
-
-        // Create open options - don't run hooks or file ops since this is an existing worktree.
-        // Pane commands are handled by the open workflow: if the window exists it just switches,
-        // if not it creates the window and runs pane commands.
-        let open_options = SetupOptions {
-            run_hooks: false,
-            run_file_ops: false,
-            run_pane_commands: options.run_pane_commands,
-            prompt_file_path: options.prompt_file_path.clone(),
-            focus_window: options.focus_window,
-            working_dir: options.working_dir.clone(),
-            config_root: options.config_root.clone(),
-            open_if_exists: false,
-            mode: options.mode,
-            target_window_name: options.target_window_name.clone(),
-            target_session_name: options.target_session_name.clone(),
-            window_session_name: options.window_session_name.clone(),
-            window_token: options.window_token.clone(),
-            primary_window: options.primary_window,
-            resume_mode: options.resume_mode.clone(),
-        };
-
-        // In file-only mode, pass the prompt so open can write it to the worktree
-        let file_only_prompt = if prompt_file_only { prompt } else { None };
-
-        return super::open::open(
-            branch_name,
-            context,
-            open_options,
-            false,
-            mode_override,
-            file_only_prompt,
-            agent,
-        );
-    }
-
-    // Check target using the mux target name that will be created.
-    if target_exists {
-        return Err(anyhow!(
-            "A {} {} named '{}' already exists.\n\
-             Hint: use --name or --target-name to specify a unique name.",
-            context.mux.name(),
-            target.kind(),
-            MuxHandle::new(
+        let full_target_name = target.full_name();
+        let mut target_exists = target.exists()?;
+        let mut current_target_name = requested_target_name.to_string();
+        if target_exists && !worktree_exists && !is_explicit_name && !explicit_target_name {
+            let project_name = context
+                .main_worktree_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("repo");
+            let mut project_slug = slug::slugify(project_name);
+            if project_slug.is_empty() || project_slug.chars().all(|c| c.is_ascii_digit()) {
+                project_slug = format!(
+                    "repo-{}",
+                    if project_slug.is_empty() {
+                        "unnamed"
+                    } else {
+                        &project_slug
+                    }
+                );
+            }
+            current_handle = format!("{}-{}", handle, project_slug);
+            current_target_name = current_handle.clone();
+            let suffixed_target = MuxHandle::new(
                 context.mux.as_ref(),
                 options.mode,
                 &context.prefix,
                 &current_target_name,
+            );
+            eprintln!(
+                "workmux: {} '{}' exists in another repository, using '{}'",
+                target.kind(),
+                full_target_name,
+                suffixed_target.full_name()
+            );
+            target_exists = suffixed_target.exists()?;
+        }
+
+        if options.open_if_exists && (target_exists || worktree_exists) {
+            debug!(
+                branch = branch_name,
+                handle = handle,
+                target_exists,
+                worktree_exists,
+                "create:delegating to open (open_if_exists=true)"
+            );
+            let open_options = SetupOptions {
+                run_hooks: false,
+                run_file_ops: false,
+                run_pane_commands: options.run_pane_commands,
+                prompt_file_path: options.prompt_file_path.clone(),
+                focus_window: options.focus_window,
+                working_dir: options.working_dir.clone(),
+                config_root: options.config_root.clone(),
+                open_if_exists: false,
+                mode: options.mode,
+                target_window_name: options.target_window_name.clone(),
+                target_session_name: options.target_session_name.clone(),
+                window_session_name: options.window_session_name.clone(),
+                window_token: options.window_token.clone(),
+                primary_window: options.primary_window,
+                resume_mode: options.resume_mode.clone(),
+            };
+            let file_only_prompt = if prompt_file_only { prompt } else { None };
+            return super::open::open(
+                branch_name,
+                context,
+                open_options,
+                false,
+                mode_override,
+                file_only_prompt,
+                agent,
             )
-            .full_name()
-        ));
+            .map(CreateOutcome::Attached);
+        }
+
+        if target_exists {
+            return Err(anyhow!(
+                "A {} {} named '{}' already exists.\n\
+                 Hint: use --name or --target-name to specify a unique name.",
+                context.mux.name(),
+                target.kind(),
+                MuxHandle::new(
+                    context.mux.as_ref(),
+                    options.mode,
+                    &context.prefix,
+                    &current_target_name,
+                )
+                .full_name()
+            ));
+        }
     }
 
     // Check if branch already has a worktree
@@ -431,78 +438,88 @@ pub fn create(context: &WorkflowContext, args: CreateArgs) -> Result<CreateResul
     )
     .context("Failed to create git worktree")?;
 
-    // Store the tmux mode in git config for cleanup and reopen operations.
-    // This allows remove/close/merge/open to know whether to kill a window or session.
-    let mode_str = match options.mode {
-        MuxMode::Session => "session",
-        MuxMode::Window => "window",
-    };
-    git::set_worktree_meta_in(
-        &current_handle,
-        "mode",
-        mode_str,
-        Some(&context.execution_dir),
-    )
-    .with_context(|| {
-        format!(
-            "Failed to store tmux mode for worktree '{}'",
-            current_handle
-        )
-    })?;
-    if let Some(target_window_name) = &options.target_window_name {
+    if headless {
+        if let Err(error) = git::set_worktree_attachment_in(
+            &current_handle,
+            git::WorktreeAttachment::Headless,
+            Some(&context.execution_dir),
+        ) {
+            drop(_config_lock);
+            let rollback = cleanup::cleanup_headless(
+                context,
+                branch_name,
+                &current_handle,
+                &worktree_path,
+                cleanup::CleanupOptions {
+                    force: true,
+                    keep_branch: !create_new,
+                    no_hooks: true,
+                    show_hook_output: false,
+                },
+            );
+            return match rollback {
+                Ok(_) => Err(error),
+                Err(rollback_error) => Err(error.context(format!(
+                    "Metadata rollback also failed for '{}': {rollback_error:#}",
+                    worktree_path.display()
+                ))),
+            };
+        }
+    } else {
+        let mode_str = match options.mode {
+            MuxMode::Session => "session",
+            MuxMode::Window => "window",
+        };
         git::set_worktree_meta_in(
             &current_handle,
-            "target-window",
-            target_window_name,
+            "mode",
+            mode_str,
             Some(&context.execution_dir),
         )
         .with_context(|| {
             format!(
-                "Failed to store target window for worktree '{}'",
+                "Failed to store tmux mode for worktree '{}'",
                 current_handle
             )
         })?;
-    }
-    if let Some(target_session_name) = &options.target_session_name {
-        git::set_worktree_meta_in(
+        git::set_worktree_attachment_in(
             &current_handle,
-            "target-session",
-            target_session_name,
+            git::WorktreeAttachment::Multiplexer,
             Some(&context.execution_dir),
-        )
-        .with_context(|| {
-            format!(
-                "Failed to store target session for worktree '{}'",
-                current_handle
-            )
-        })?;
+        )?;
+        if let Some(target_window_name) = &options.target_window_name {
+            git::set_worktree_meta_in(
+                &current_handle,
+                "target-window",
+                target_window_name,
+                Some(&context.execution_dir),
+            )?;
+        }
+        if let Some(target_session_name) = &options.target_session_name {
+            git::set_worktree_meta_in(
+                &current_handle,
+                "target-session",
+                target_session_name,
+                Some(&context.execution_dir),
+            )?;
+        }
+        if let Some(window_session_name) = &options.window_session_name {
+            git::set_worktree_meta_in(
+                &current_handle,
+                "window-session",
+                window_session_name,
+                Some(&context.execution_dir),
+            )?;
+        }
+        if options.mode == MuxMode::Window && context.mux.supports_window_ownership() {
+            options.window_token = Some(git::ensure_worktree_window_token_in(
+                &current_handle,
+                Some(&context.execution_dir),
+            )?);
+            options.primary_window = true;
+        }
+        debug!(handle = %current_handle, mode = mode_str, "create:stored mux metadata");
     }
-    if let Some(window_session_name) = &options.window_session_name {
-        git::set_worktree_meta_in(
-            &current_handle,
-            "window-session",
-            window_session_name,
-            Some(&context.execution_dir),
-        )
-        .with_context(|| {
-            format!(
-                "Failed to store window session for worktree '{}'",
-                current_handle
-            )
-        })?;
-    }
-    if options.mode == MuxMode::Window && context.mux.supports_window_ownership() {
-        options.window_token = Some(git::ensure_worktree_window_token_in(
-            &current_handle,
-            Some(&context.execution_dir),
-        )?);
-        options.primary_window = true;
-    }
-    debug!(
-        handle = %current_handle,
-        mode = mode_str,
-        "create:stored tmux mode in git config"
-    );
 
     // Release the config lock before proceeding to non-git operations
     // (prompt files, tmux setup, hooks, etc.)
@@ -571,6 +588,54 @@ pub fn create(context: &WorkflowContext, args: CreateArgs) -> Result<CreateResul
         config_root,
         ..options
     };
+    if headless {
+        let hook_output = if json_output {
+            crate::cmd::ShellOutput::RedirectToStderr
+        } else {
+            crate::cmd::ShellOutput::Inherit
+        };
+        let provisioned = match setup::provision_environment(
+            branch_name,
+            &current_handle,
+            &worktree_path,
+            &context.config,
+            &options_with_prompt,
+            hook_output,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let rollback = cleanup::cleanup_headless(
+                    context,
+                    branch_name,
+                    &current_handle,
+                    &worktree_path,
+                    cleanup::CleanupOptions {
+                        force: true,
+                        keep_branch: !create_new,
+                        no_hooks: true,
+                        show_hook_output: false,
+                    },
+                );
+                return match rollback {
+                    Ok(_) => Err(error),
+                    Err(rollback_error) => Err(error.context(format!(
+                        "Provisioning rollback also failed for '{}': {rollback_error:#}",
+                        worktree_path.display()
+                    ))),
+                };
+            }
+        };
+        let result = ProvisionResult {
+            worktree_path,
+            working_directory: provisioned.working_directory,
+            branch_name: branch_name.to_string(),
+            post_create_hooks_run: provisioned.post_create_hooks_run,
+            base_branch: base_branch_for_creation,
+            resolved_handle: current_handle,
+        };
+        return Ok(CreateOutcome::Provisioned(result));
+    }
+
     let mut result = setup::setup_environment(
         context.mux.as_ref(),
         branch_name,
@@ -581,14 +646,14 @@ pub fn create(context: &WorkflowContext, args: CreateArgs) -> Result<CreateResul
         agent,
         placement_window_id,
     )?;
-    result.base_branch = base_branch_for_creation.clone();
+    result.base_branch = base_branch_for_creation;
     info!(
         branch = branch_name,
         path = %result.worktree_path.display(),
         hooks_run = result.post_create_hooks_run,
         "create:completed"
     );
-    Ok(result)
+    Ok(CreateOutcome::Attached(result))
 }
 
 /// Create a new worktree and move uncommitted changes from the current worktree into it.

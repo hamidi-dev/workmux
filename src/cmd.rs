@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use tracing::{debug, trace};
@@ -119,14 +120,21 @@ impl<'a> Cmd<'a> {
     }
 }
 
-/// Helper to create a shell command with additional environment variables
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellOutput {
+    Inherit,
+    Silent,
+    RedirectToStderr,
+}
+
+/// Helper to create a shell command with additional environment variables.
 pub fn shell_command_with_env(
     hook_shell: Option<&[String]>,
     command: &str,
     workdir: &Path,
     env_vars: &[(&str, &str)],
 ) -> Result<()> {
-    shell_command_with_env_output(hook_shell, command, workdir, env_vars, true)
+    shell_command_with_env_mode(hook_shell, command, workdir, env_vars, ShellOutput::Inherit)
 }
 
 /// Run a lifecycle hook with additional environment variables and optional output inheritance.
@@ -137,6 +145,21 @@ pub fn shell_command_with_env_output(
     workdir: &Path,
     env_vars: &[(&str, &str)],
     inherit_output: bool,
+) -> Result<()> {
+    let output = if inherit_output {
+        ShellOutput::Inherit
+    } else {
+        ShellOutput::Silent
+    };
+    shell_command_with_env_mode(hook_shell, command, workdir, env_vars, output)
+}
+
+pub fn shell_command_with_env_mode(
+    hook_shell: Option<&[String]>,
+    command: &str,
+    workdir: &Path,
+    env_vars: &[(&str, &str)],
+    output: ShellOutput,
 ) -> Result<()> {
     let default_shell = ["bash".to_string(), "-c".to_string()];
     let argv = hook_shell.unwrap_or(&default_shell);
@@ -150,8 +173,19 @@ pub fn shell_command_with_env_output(
     let mut cmd = Command::new(executable);
     cmd.args(args).arg(command).current_dir(workdir);
 
-    if !inherit_output {
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    match output {
+        ShellOutput::Inherit => {}
+        ShellOutput::Silent => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        ShellOutput::RedirectToStderr => {
+            let stderr = std::io::stderr();
+            let stdout = stderr
+                .as_fd()
+                .try_clone_to_owned()
+                .context("Failed to redirect hook output to stderr")?;
+            cmd.stdout(Stdio::from(stdout)).stderr(Stdio::inherit());
+        }
     }
 
     for (key, value) in env_vars {

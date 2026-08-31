@@ -30,6 +30,16 @@ pub struct CreateArgs<'a> {
     pub fork_source: Option<ForkSource>,
 }
 
+/// Result of provisioning a worktree without a multiplexer target.
+pub struct ProvisionResult {
+    pub worktree_path: PathBuf,
+    pub working_directory: PathBuf,
+    pub branch_name: String,
+    pub post_create_hooks_run: usize,
+    pub base_branch: Option<String>,
+    pub resolved_handle: String,
+}
+
 /// Result of creating a worktree
 pub struct CreateResult {
     pub worktree_path: PathBuf,

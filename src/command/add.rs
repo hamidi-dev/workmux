@@ -14,6 +14,7 @@ use crate::workflow::pr::{
 use crate::workflow::prompt_loader::{PromptLoadArgs, load_prompt, parse_prompt_with_frontmatter};
 use crate::{config, git, workflow};
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
@@ -155,10 +156,10 @@ fn stdin_has_data(_stdin: &std::io::Stdin) -> Result<bool> {
 
 /// Check preconditions for the add command (git repo and multiplexer session).
 /// Returns Ok(()) if all preconditions are met, or an error listing all failures.
-fn check_preconditions() -> Result<()> {
+fn check_preconditions(headless: bool) -> Result<()> {
     let is_git = git::is_git_repo()?;
     let mux = create_backend(detect_backend());
-    let is_mux_running = mux.is_running()?;
+    let is_mux_running = headless || mux.is_running()?;
 
     if is_git && is_mux_running {
         return Ok(());
@@ -212,6 +213,149 @@ fn resolve_layout(config: &mut config::Config, layout_name: &str) -> Result<()> 
     Ok(())
 }
 
+#[derive(Serialize)]
+struct HeadlessReceipt<'a> {
+    schema_version: u32,
+    handle: &'a str,
+    branch: &'a str,
+    worktree_path: &'a std::path::Path,
+    working_directory: &'a std::path::Path,
+    base_branch: Option<&'a str>,
+    post_create_hooks_run: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_headless(
+    branch_name: Option<&str>,
+    pr: Option<PrReference>,
+    auto_name: bool,
+    base: Option<&str>,
+    name: Option<&str>,
+    target_name: Option<&str>,
+    parent_session: Option<&str>,
+    prompt: &PromptArgs,
+    setup: &SetupFlags,
+    rescue: &RescueArgs,
+    multi: &MultiArgs,
+    layout: Option<&str>,
+    fork: Option<&str>,
+    wait: bool,
+    dry_run: bool,
+    mode_override: Option<MuxMode>,
+    json: bool,
+    config_override: Option<&std::path::Path>,
+) -> Result<()> {
+    if crate::sandbox::guest::is_sandbox_guest() {
+        bail!("--headless is not supported from inside a sandbox");
+    }
+    if pr.is_some() {
+        bail!("--pr cannot be used with --headless");
+    }
+    if auto_name {
+        bail!("--auto-name cannot be used with --headless");
+    }
+    if target_name.is_some() || parent_session.is_some() || mode_override.is_some() {
+        bail!("Multiplexer target options cannot be used with --headless");
+    }
+    if prompt.has_any() || prompt.prompt_file_only {
+        bail!("Prompt options cannot be used with --headless");
+    }
+    if setup.no_pane_cmds || setup.background || setup.open_if_exists || setup.sandbox {
+        bail!(
+            "Pane, background, open-existing, and sandbox options cannot be used with --headless"
+        );
+    }
+    if rescue.with_changes || rescue.patch || rescue.include_untracked {
+        bail!("Change rescue options cannot be used with --headless");
+    }
+    if !multi.agent.is_empty()
+        || multi.count.is_some()
+        || multi.foreach.is_some()
+        || multi.max_concurrent.is_some()
+    {
+        bail!("Multi-worktree options cannot be used with --headless");
+    }
+    if layout.is_some() || fork.is_some() || wait || dry_run {
+        bail!("Layout, fork, wait, and dry-run options cannot be used with --headless");
+    }
+
+    check_preconditions(true)?;
+    let branch_name = branch_name.context("A branch name is required with --headless")?;
+    let (config, config_location) = config::Config::load_with_location(None, config_override)?;
+    let mux = create_backend(detect_backend());
+    let context = workflow::WorkflowContext::new(config, mux, config_location)?;
+    if let Some((candidate_remote, _)) = branch_name.split_once('/')
+        && git::remote_exists_in(candidate_remote, Some(&context.execution_dir))?
+    {
+        bail!(
+            "--headless treats branch names as local and does not resolve remote branch '{}'; pass a local branch name",
+            branch_name
+        );
+    }
+    let handle = crate::naming::derive_handle(branch_name, name, &context.config)?;
+    let configured_base = if base.is_none() {
+        workflow::resolve_configured_base_branch(&context.config, &context.execution_dir)?
+    } else {
+        None
+    };
+    let resolved_base = base.or(configured_base.as_deref());
+    let options = SetupOptions::new(!setup.no_hooks, !setup.no_file_ops, false);
+
+    if !json {
+        super::announce_hooks(
+            &context.config,
+            Some(&options),
+            super::HookPhase::PostCreate,
+        );
+    }
+
+    let result = workflow::create_headless(
+        &context,
+        workflow::CreateArgs {
+            branch_name,
+            handle: &handle,
+            base_branch: resolved_base,
+            remote_branch: None,
+            checkout_ref: None,
+            prompt: None,
+            options,
+            mode_override: None,
+            agent: None,
+            is_explicit_name: name.is_some(),
+            prompt_file_only: false,
+            fork_source: None,
+        },
+        json,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to provision headless worktree for branch '{}'",
+            branch_name
+        )
+    })?;
+
+    if json {
+        let receipt = HeadlessReceipt {
+            schema_version: 1,
+            handle: &result.resolved_handle,
+            branch: &result.branch_name,
+            worktree_path: &result.worktree_path,
+            working_directory: &result.working_directory,
+            base_branch: result.base_branch.as_deref(),
+            post_create_hooks_run: result.post_create_hooks_run,
+        };
+        println!("{}", serde_json::to_string(&receipt)?);
+    } else {
+        println!(
+            "✓ Successfully provisioned headless worktree for '{}'\n  Worktree: {}\n  Working directory: {}",
+            result.branch_name,
+            result.worktree_path.display(),
+            result.working_directory.display()
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     branch_name: Option<&str>,
@@ -232,8 +376,33 @@ pub fn run(
     wait: bool,
     dry_run: bool,
     mode_override: Option<MuxMode>,
+    headless: bool,
+    json: bool,
     config_override: Option<&std::path::Path>,
 ) -> Result<()> {
+    if headless {
+        return run_headless(
+            branch_name,
+            pr,
+            auto_name,
+            base,
+            name.as_deref(),
+            target_name.as_deref(),
+            parent_session.as_deref(),
+            &prompt_args,
+            &setup,
+            &rescue,
+            &multi,
+            layout.as_deref(),
+            fork.as_deref(),
+            wait,
+            dry_run,
+            mode_override,
+            json,
+            config_override,
+        );
+    }
+
     // Inside a sandbox guest, route through RPC to the host supervisor
     if crate::sandbox::guest::is_sandbox_guest() {
         if dry_run {
@@ -275,7 +444,7 @@ pub fn run(
     // Creation requires both git and a running multiplexer. A dry run only reads
     // repository and configuration state.
     if !dry_run {
-        check_preconditions()?;
+        check_preconditions(false)?;
     }
 
     // Extract sandbox override before consuming setup flags

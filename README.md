@@ -638,6 +638,10 @@ immediately. If the branch doesn't exist, it will be created automatically.
 - `--dry-run`: Print the resolved worktree path, branch, base, multiplexer
   target, file operations, and post-create hooks without creating or modifying
   anything.
+- `--headless`: Create the worktree, apply file operations, and run
+  `post_create` hooks without requiring or creating a multiplexer target.
+- `--json`: Emit a versioned provisioning receipt on stdout. Requires
+  `--headless`. Hook output and diagnostics use stderr.
 - `--config <path>`: Use an alternate config file for this invocation. Still
   merges with global config.
 - `--fork`: Fork the last conversation from the current worktree into the new
@@ -677,6 +681,30 @@ workmux uses live pane working directories when their closest matches identify
 one session. A tmux server with one session is the final fallback. Remaining
 ambiguity requires `--parent-session <name>`. The working directory selects the
 Git repository and only provides conservative evidence for tmux placement.
+
+#### Headless provisioning
+
+Automation can provision a fully configured worktree without asking workmux to
+manage its terminal process:
+
+```bash
+workmux add suba-parser-a1b2c3d4 \
+  --name suba-parser-a1b2c3d4 \
+  --headless \
+  --json
+```
+
+The command creates or checks out the local branch, applies configured file
+operations, and runs `post_create` hooks. It does not inspect or create mux
+sessions, windows, panes, layouts, or pane commands. The JSON receipt includes
+`schema_version`, `handle`, `branch`, absolute `worktree_path`, absolute
+`working_directory`, `base_branch`, and `post_create_hooks_run`.
+
+Headless worktrees persist until removed with `workmux remove <handle>`. A later
+`workmux open <handle>` attaches a workmux-managed multiplexer target. Headless
+branch arguments are local branch names; remote branch syntax is rejected.
+Prompt, rescue, multi-worktree, sandbox, wait, dry-run, and mux-specific options
+are not accepted with `--headless`.
 
 #### Examples
 

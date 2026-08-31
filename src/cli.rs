@@ -368,6 +368,14 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
+        /// Create and provision the worktree without a multiplexer target
+        #[arg(long)]
+        headless: bool,
+
+        /// Emit a machine-readable headless provisioning receipt
+        #[arg(long, requires = "headless")]
+        json: bool,
+
         /// Use an alternate config file for this invocation (still merges with global config)
         #[arg(long, value_hint = clap::ValueHint::FilePath)]
         config: Option<PathBuf>,
@@ -889,28 +897,37 @@ enum ClaudeCommands {
     Prune,
 }
 
+fn is_headless_add(cmd: &Commands) -> bool {
+    matches!(cmd, Commands::Add { headless: true, .. })
+}
+
 /// Check if the command should show the nerdfont setup prompt.
 /// Only commands that display icons should trigger the prompt.
 fn should_prompt_nerdfont(cmd: &Commands) -> bool {
-    matches!(
-        cmd,
-        Commands::Add { .. } | Commands::Init | Commands::Dashboard { .. } | Commands::List { .. }
-    )
+    !is_headless_add(cmd)
+        && matches!(
+            cmd,
+            Commands::Add { .. }
+                | Commands::Init
+                | Commands::Dashboard { .. }
+                | Commands::List { .. }
+        )
 }
 
 /// Check if the command should show the status tracking setup wizard.
 /// Excludes `Setup` to avoid double-prompting (the setup command handles its own flow).
 /// Excludes `Dashboard` because the wizard prompt interferes with the TUI.
 fn should_prompt_status_setup(cmd: &Commands) -> bool {
-    matches!(
-        cmd,
-        Commands::Add { .. } | Commands::Init | Commands::List { .. }
-    )
+    !is_headless_add(cmd)
+        && matches!(
+            cmd,
+            Commands::Add { .. } | Commands::Init | Commands::List { .. }
+        )
 }
 
 /// Check if the command should trigger a background update check.
 fn should_check_update(cmd: &Commands) -> bool {
-    matches!(cmd, Commands::Add { .. })
+    !is_headless_add(cmd) && matches!(cmd, Commands::Add { .. })
 }
 
 // --- Public Entry Point ---
@@ -1057,6 +1074,8 @@ pub fn run() -> Result<()> {
             mode,
             session,
             dry_run,
+            headless,
+            json,
             config,
         } => {
             let mode_override = mode
@@ -1081,6 +1100,8 @@ pub fn run() -> Result<()> {
                 wait,
                 dry_run,
                 mode_override,
+                headless,
+                json,
                 config.as_deref(),
             )
         }
