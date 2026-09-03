@@ -7,7 +7,7 @@ use crossterm::{
         MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::backend::CrosstermBackend;
 use std::io;
@@ -47,12 +47,30 @@ enum AppEvent {
 fn spawn_input_thread(tx: mpsc::Sender<AppEvent>) {
     thread::spawn(move || {
         // event::read() blocks until input is available - zero CPU
-        while let Ok(ev) = event::read() {
-            if tx.send(AppEvent::Input(ev)).is_err() {
-                break;
+        loop {
+            match event::read() {
+                Ok(ev) => {
+                    if tx.send(AppEvent::Input(ev)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) if is_transient_cursor_error(&error) => {
+                    tracing::debug!(%error, "retrying sidebar input after cursor query timeout");
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "sidebar input reader stopped");
+                    break;
+                }
             }
         }
     });
+}
+
+fn is_transient_cursor_error(error: &io::Error) -> bool {
+    error
+        .to_string()
+        .contains("cursor position could not be read within a normal duration")
 }
 
 /// Run the sidebar TUI (called by the hidden `_sidebar-run` command).
@@ -487,6 +505,16 @@ mod tests {
         // Snapshot-driven checks remain available after the one-shot deadline.
         check.pane_count = Some(1);
         assert!(check.should_exit(Some(&identity), |_, _| true));
+    }
+
+    #[test]
+    fn cursor_query_timeout_is_transient() {
+        let transient =
+            io::Error::other("The cursor position could not be read within a normal duration");
+        let permanent = io::Error::new(io::ErrorKind::BrokenPipe, "terminal closed");
+
+        assert!(is_transient_cursor_error(&transient));
+        assert!(!is_transient_cursor_error(&permanent));
     }
 
     #[test]
