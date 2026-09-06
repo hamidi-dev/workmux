@@ -8,16 +8,69 @@ use anyhow::{Context, Result, anyhow};
 use std::str::FromStr;
 
 const PR_URL_PREFIX: &str = "https://";
-const PR_REFERENCE_ERROR: &str = "expected a pull request number or a full GitHub pull request URL, including GitHub Enterprise, like https://github.example.com/owner/repo/pull/123";
+const PR_REFERENCE_ERROR: &str = "expected a pull request number or a full GitHub pull request URL, or a GitLab merge request URL, including self-hosted instances, like https://github.example.com/owner/repo/pull/123";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub enum Forge {
+    Github,
+    Gitlab,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CheckoutRef {
+    pub number: u32,
+    pub forge: Forge,
+}
+
+impl CheckoutRef {
+    pub fn head_ref(self) -> String {
+        match self.forge {
+            Forge::Github => format!("refs/pull/{}/head", self.number),
+            Forge::Gitlab => format!("refs/merge-requests/{}/head", self.number),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrReference {
     number: u32,
+    forge: Option<Forge>,
+    repository: Option<crate::gitlab::Repository>,
 }
 
 impl PrReference {
-    pub fn number(self) -> u32 {
+    pub fn number(&self) -> u32 {
         self.number
+    }
+
+    pub fn resolve(
+        &self,
+        explicit: Option<Forge>,
+        branch: Option<&str>,
+        dry_run: bool,
+    ) -> Result<PrCheckoutResult> {
+        if let (Some(url_forge), Some(explicit)) = (self.forge, explicit)
+            && url_forge != explicit
+        {
+            return Err(anyhow!(
+                "--forge conflicts with the provider in the --pr URL"
+            ));
+        }
+        let forge = explicit.or(self.forge).unwrap_or_else(|| {
+            git::get_remote_url("origin")
+                .ok()
+                .and_then(|url| crate::gitlab::Repository::parse(&url).ok())
+                .filter(|repo| repo.host.eq_ignore_ascii_case("gitlab.com"))
+                .map(|_| Forge::Gitlab)
+                .unwrap_or(Forge::Github)
+        });
+        match forge {
+            Forge::Gitlab => {
+                crate::gitlab::resolve(self.number(), self.repository.as_ref(), branch, dry_run)
+            }
+            Forge::Github if dry_run => resolve_pr_ref_dry_run(self.number(), branch),
+            Forge::Github => resolve_pr_ref(self.number(), branch),
+        }
     }
 }
 
@@ -25,6 +78,26 @@ impl FromStr for PrReference {
     type Err = String;
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if let Some((repository, number)) = value
+            .trim_end_matches('/')
+            .rsplit_once("/-/merge_requests/")
+        {
+            if !repository.starts_with("https://") && !repository.starts_with("http://") {
+                return Err(PR_REFERENCE_ERROR.to_string());
+            }
+            let repository = crate::gitlab::Repository::parse(repository)
+                .map_err(|_| PR_REFERENCE_ERROR.to_string())?;
+            let number = number
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| PR_REFERENCE_ERROR.to_string())?;
+            return Ok(Self {
+                number,
+                forge: Some(Forge::Gitlab),
+                repository: Some(repository),
+            });
+        }
         let number = if let Ok(number) = value.parse() {
             number
         } else {
@@ -49,7 +122,15 @@ impl FromStr for PrReference {
             number.parse().map_err(|_| PR_REFERENCE_ERROR.to_string())?
         };
 
-        Ok(Self { number })
+        if number == 0 {
+            return Err(PR_REFERENCE_ERROR.to_string());
+        }
+
+        Ok(Self {
+            number,
+            forge: value.starts_with(PR_URL_PREFIX).then_some(Forge::Github),
+            repository: None,
+        })
     }
 }
 
@@ -90,7 +171,9 @@ fn fork_local_branch_name(owner: &str, branch: &str) -> String {
 }
 
 /// Result of resolving a PR checkout.
+#[derive(Debug)]
 pub struct PrCheckoutResult {
+    pub checkout_ref: CheckoutRef,
     pub local_branch: String,
     pub remote_branch: String,
 }
@@ -153,6 +236,10 @@ pub fn resolve_pr_ref(
     let remote_branch = format!("{}/{}", remote_name, pr_details.head_ref_name);
 
     Ok(PrCheckoutResult {
+        checkout_ref: CheckoutRef {
+            number: pr_number,
+            forge: Forge::Github,
+        },
         local_branch,
         remote_branch,
     })
@@ -187,6 +274,10 @@ pub fn resolve_pr_ref_dry_run(
         }
     });
     Ok(PrCheckoutResult {
+        checkout_ref: CheckoutRef {
+            number: pr_number,
+            forge: Forge::Github,
+        },
         local_branch,
         remote_branch: format!("{}/{}", remote_name, pr_details.head_ref_name),
     })
@@ -385,11 +476,67 @@ mod tests {
     }
 
     #[test]
+    fn parses_gitlab_references() {
+        for url in [
+            "https://gitlab.com/group/project/-/merge_requests/123",
+            "https://gitlab.example.com/group/subgroup/project/-/merge_requests/123/",
+            "http://gitlab.example.com:8080/group/project/-/merge_requests/123",
+        ] {
+            let reference: PrReference = url.parse().unwrap();
+            assert_eq!(reference.number(), 123);
+            assert_eq!(reference.forge, Some(Forge::Gitlab));
+            assert!(reference.repository.is_some());
+            assert!(
+                reference
+                    .resolve(Some(Forge::Github), None, true)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("conflicts")
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_gitlab_references() {
+        for url in [
+            "https://gitlab.com/group/project/-/merge_requests/0",
+            "https://gitlab.com/group/project/-/merge_requests/123/diffs",
+            "https://gitlab.com/group/project/-/merge_requests/123?query",
+            "https://gitlab.com/group/project/-/merge_requests/nope",
+            "https://gitlab.com/group/project/-/issues/123",
+        ] {
+            assert!(url.parse::<PrReference>().is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn review_ref_uses_forge_namespace() {
+        assert_eq!(
+            CheckoutRef {
+                number: 123,
+                forge: Forge::Github
+            }
+            .head_ref(),
+            "refs/pull/123/head"
+        );
+        assert_eq!(
+            CheckoutRef {
+                number: 123,
+                forge: Forge::Gitlab
+            }
+            .head_ref(),
+            "refs/merge-requests/123/head"
+        );
+    }
+
+    #[test]
     fn rejects_invalid_pr_references() {
         for value in [
+            "0",
             "not-a-pr",
             "http://github.com/raine/workmux/pull/190",
             "https://github.com/raine/workmux/issues/190",
+            "https://github.com/raine/workmux/pull/0",
             "https://github.com/raine/workmux/pull/not-a-number",
             "https://github.com/raine/workmux/pull/190/files",
         ] {

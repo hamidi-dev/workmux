@@ -8,7 +8,9 @@ use crate::template::{
     render_prompt_body, validate_template_variables,
 };
 use crate::workflow::SetupOptions;
-use crate::workflow::pr::{PrReference, detect_remote_branch, detect_remote_branch_dry_run};
+use crate::workflow::pr::{
+    CheckoutRef, Forge, PrReference, detect_remote_branch, detect_remote_branch_dry_run,
+};
 use crate::workflow::prompt_loader::{PromptLoadArgs, load_prompt, parse_prompt_with_frontmatter};
 use crate::{config, git, workflow};
 use anyhow::{Context, Result, anyhow, bail};
@@ -214,6 +216,7 @@ fn resolve_layout(config: &mut config::Config, layout_name: &str) -> Result<()> 
 pub fn run(
     branch_name: Option<&str>,
     pr: Option<PrReference>,
+    forge: Option<Forge>,
     auto_name: bool,
     base: Option<&str>,
     name: Option<String>,
@@ -365,6 +368,7 @@ pub fn run(
 
     // Handle auto-name: load prompt first, generate branch name
     // In multi-worktree mode with auto-name, we defer LLM generation to the loop
+    let mut checkout_ref = None;
     let (final_branch_name, preloaded_prompt, remote_branch_for_pr, deferred_auto_name) =
         if auto_name {
             // Use editor if no prompt source specified, otherwise use provided source
@@ -404,13 +408,8 @@ pub fn run(
                 (generated, Some(prompt), None, false)
             }
         } else if let Some(pr_reference) = pr {
-            // Handle PR checkout if --pr flag is provided
-            let pr_number = pr_reference.number();
-            let result = if dry_run {
-                workflow::pr::resolve_pr_ref_dry_run(pr_number, branch_name)?
-            } else {
-                workflow::pr::resolve_pr_ref(pr_number, branch_name)?
-            };
+            let result = pr_reference.resolve(forge, branch_name, dry_run)?;
+            checkout_ref = Some(result.checkout_ref);
             (result.local_branch, None, Some(result.remote_branch), false)
         } else {
             // Normal flow: use provided branch name
@@ -622,7 +621,7 @@ pub fn run(
         specs: &specs,
         resolved_base,
         remote_branch: remote_branch.as_deref(),
-        pr_number: pr.map(PrReference::number),
+        checkout_ref,
         prompt_doc: prompt_doc.as_ref(),
         options,
         mode_override,
@@ -763,7 +762,7 @@ struct CreationPlan<'a> {
     specs: &'a [WorktreeSpec],
     resolved_base: Option<&'a str>,
     remote_branch: Option<&'a str>,
-    pr_number: Option<u32>,
+    checkout_ref: Option<CheckoutRef>,
     prompt_doc: Option<&'a PromptDocument>,
     options: SetupOptions,
     mode_override: Option<MuxMode>,
@@ -942,7 +941,7 @@ impl<'a> CreationPlan<'a> {
                     handle: &handle,
                     base_branch: resolved_base,
                     remote_branch: self.remote_branch,
-                    pr_number: self.pr_number,
+                    checkout_ref: self.checkout_ref,
                     prompt: prompt_for_spec.as_ref(),
                     options: self.options.clone(),
                     mode_override,

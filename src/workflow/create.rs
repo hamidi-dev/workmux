@@ -42,7 +42,7 @@ pub fn create(context: &WorkflowContext, args: CreateArgs) -> Result<CreateResul
         handle,
         base_branch,
         remote_branch,
-        pr_number,
+        checkout_ref,
         prompt,
         mut options,
         mode_override,
@@ -229,7 +229,7 @@ pub fn create(context: &WorkflowContext, args: CreateArgs) -> Result<CreateResul
 
     // Auto-detect: create branch if it doesn't exist
     let branch_exists = git::branch_exists_in(branch_name, Some(&context.execution_dir))?;
-    if branch_exists && remote_branch.is_some() && pr_number.is_none() {
+    if branch_exists && remote_branch.is_some() && checkout_ref.is_none() {
         return Err(anyhow!(
             "Branch '{}' already exists. Remove '--remote' or pick a different branch name.",
             branch_name
@@ -253,25 +253,39 @@ pub fn create(context: &WorkflowContext, args: CreateArgs) -> Result<CreateResul
             ));
         }
 
-        // For PR checkout, try to fetch refs/pull/N/head from origin into the
-        // remote-tracking namespace. This ensures the PR code is available
-        // even if the head branch was deleted on the fork.
-        // If the PR ref doesn't exist (e.g., non-GitHub forge, local test repo),
-        // fall back to fetching from the fork remote directly.
-        if let Some(pr_number) = pr_number {
+        // Review refs on the target repository also cover deleted source branches.
+        if let Some(checkout_ref) = checkout_ref {
             let pr_refspec = format!(
-                "+refs/pull/{}/head:refs/remotes/{}/{}",
-                pr_number, spec.remote, spec.branch
+                "+{}:refs/remotes/{}/{}",
+                checkout_ref.head_ref(),
+                spec.remote,
+                spec.branch
             );
-            let pr_fetch =
-                spinner::with_spinner(&format!("Fetching PR #{} from origin", pr_number), || {
-                    git::fetch_refspec_in("origin", &pr_refspec, Some(&context.execution_dir))
-                });
+            let pr_fetch = spinner::with_spinner(
+                &format!("Fetching review #{} from origin", checkout_ref.number),
+                || git::fetch_refspec_in("origin", &pr_refspec, Some(&context.execution_dir)),
+            );
             if pr_fetch.is_err() {
-                spinner::with_spinner(&format!("Fetching from '{}'", spec.remote), || {
-                    git::fetch_remote_in(&spec.remote, Some(&context.execution_dir))
-                })
-                .with_context(|| format!("Failed to fetch from remote '{}'", spec.remote))?;
+                let source_refspec = format!(
+                    "+refs/heads/{}:refs/remotes/{}/{}",
+                    spec.branch, spec.remote, spec.branch
+                );
+                spinner::with_spinner(
+                    &format!("Fetching branch '{}' from '{}'", spec.branch, spec.remote),
+                    || {
+                        git::fetch_refspec_in(
+                            &spec.remote,
+                            &source_refspec,
+                            Some(&context.execution_dir),
+                        )
+                    },
+                )
+                .with_context(|| {
+                    format!(
+                        "Failed to fetch branch '{}' from remote '{}'",
+                        spec.branch, spec.remote
+                    )
+                })?;
             }
         } else {
             spinner::with_spinner(&format!("Fetching from '{}'", spec.remote), || {
@@ -631,7 +645,7 @@ pub fn create_with_changes(
             handle,
             base_branch: None,
             remote_branch: None,
-            pr_number: None,
+            checkout_ref: None,
             prompt: None,
             options,
             mode_override: None,
@@ -943,6 +957,128 @@ mod tests {
     }
 
     #[test]
+    fn review_checkout_fallback_fetches_the_source_branch_explicitly() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&source);
+        test_support::run_git(&source, &["checkout", "-b", "review-source"]);
+        std::fs::write(source.join("review.txt"), "review\n").unwrap();
+        test_support::run_git(&source, &["add", "review.txt"]);
+        test_support::run_git(&source, &["commit", "-m", "review source"]);
+
+        test_support::init_repo(&repo);
+        test_support::run_git(
+            &repo,
+            &["remote", "add", "origin", source.to_str().unwrap()],
+        );
+        test_support::run_git(
+            &repo,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+        );
+
+        let ctx =
+            WorkflowContext::new_in(&repo, Config::default(), Arc::new(TestMux), None).unwrap();
+        let mut options = SetupOptions::new(false, false, false);
+        options.focus_window = false;
+        let result = create(
+            &ctx,
+            CreateArgs {
+                branch_name: "review-source",
+                handle: "review-source",
+                base_branch: None,
+                remote_branch: Some("origin/review-source"),
+                checkout_ref: Some(super::super::pr::CheckoutRef {
+                    number: 999,
+                    forge: super::super::pr::Forge::Github,
+                }),
+                prompt: None,
+                options,
+                mode_override: None,
+                agent: None,
+                is_explicit_name: false,
+                prompt_file_only: false,
+                fork_source: None,
+            },
+        )
+        .unwrap();
+
+        assert!(result.worktree_path.join("review.txt").exists());
+        assert!(git::branch_exists_in("origin/review-source", Some(&repo)).unwrap());
+    }
+
+    #[test]
+    fn review_checkout_fallback_rejects_a_stale_source_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&source);
+        test_support::run_git(&source, &["checkout", "-b", "review-source"]);
+        std::fs::write(source.join("review.txt"), "review\n").unwrap();
+        test_support::run_git(&source, &["add", "review.txt"]);
+        test_support::run_git(&source, &["commit", "-m", "review source"]);
+
+        test_support::init_repo(&repo);
+        test_support::run_git(
+            &repo,
+            &["remote", "add", "origin", source.to_str().unwrap()],
+        );
+        test_support::run_git(
+            &repo,
+            &[
+                "fetch",
+                "origin",
+                "+refs/heads/review-source:refs/remotes/origin/review-source",
+            ],
+        );
+        test_support::run_git(&source, &["checkout", "main"]);
+        test_support::run_git(&source, &["branch", "-D", "review-source"]);
+
+        let ctx =
+            WorkflowContext::new_in(&repo, Config::default(), Arc::new(TestMux), None).unwrap();
+        let mut options = SetupOptions::new(false, false, false);
+        options.focus_window = false;
+        let error = match create(
+            &ctx,
+            CreateArgs {
+                branch_name: "review-source",
+                handle: "review-source",
+                base_branch: None,
+                remote_branch: Some("origin/review-source"),
+                checkout_ref: Some(super::super::pr::CheckoutRef {
+                    number: 999,
+                    forge: super::super::pr::Forge::Github,
+                }),
+                prompt: None,
+                options,
+                mode_override: None,
+                agent: None,
+                is_explicit_name: false,
+                prompt_file_only: false,
+                fork_source: None,
+            },
+        ) {
+            Ok(_) => panic!("stale source ref should not be accepted"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to fetch branch 'review-source' from remote 'origin'")
+        );
+        assert!(!git::branch_exists_in("review-source", Some(&repo)).unwrap());
+    }
+
+    #[test]
     fn workflow_create_uses_explicit_repo_not_process_cwd() {
         const TEST_NAME: &str =
             "workflow::create::tests::workflow_create_uses_explicit_repo_not_process_cwd";
@@ -983,7 +1119,7 @@ mod tests {
                 handle: "feature",
                 base_branch: Some("main"),
                 remote_branch: None,
-                pr_number: None,
+                checkout_ref: None,
                 prompt: None,
                 options,
                 mode_override: None,

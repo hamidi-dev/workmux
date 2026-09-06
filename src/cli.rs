@@ -1,6 +1,6 @@
 use crate::command::args::{MultiArgs, PromptArgs, RescueArgs, SetupFlags};
 use crate::config::{MuxMode, SidebarHeight, SidebarPosition, SidebarWidth};
-use crate::workflow::pr::PrReference;
+use crate::workflow::pr::{Forge, PrReference};
 use crate::{claude, command, config, git, nerdfont};
 use anyhow::{Context, Result};
 use clap::error::{ContextKind, ContextValue, ErrorKind};
@@ -298,9 +298,13 @@ enum Commands {
         #[arg(required_unless_present_any = ["pr", "auto_name"], value_parser = GitBranchParser::new())]
         branch_name: Option<String>,
 
-        /// Pull request number or full GitHub or GitHub Enterprise pull request URL to checkout
+        /// Pull/merge request number or full GitHub/GitLab URL to checkout
         #[arg(long, conflicts_with_all = ["base", "auto_name"], value_name = "NUMBER|URL")]
         pr: Option<PrReference>,
+
+        /// Forge for numeric --pr references (auto-detects gitlab.com; otherwise GitHub)
+        #[arg(long, value_enum, requires = "pr")]
+        forge: Option<Forge>,
 
         /// Generate branch name from prompt using LLM
         #[arg(short = 'A', long = "auto-name", conflicts_with = "pr")]
@@ -1035,6 +1039,7 @@ pub fn run() -> Result<()> {
         Commands::Add {
             branch_name,
             pr,
+            forge,
             auto_name,
             base,
             name,
@@ -1059,6 +1064,7 @@ pub fn run() -> Result<()> {
             command::add::run(
                 branch_name.as_deref(),
                 pr,
+                forge,
                 auto_name,
                 base.as_deref(),
                 name,
@@ -1447,6 +1453,19 @@ mod tests {
                 _ => panic!("expected add command"),
             }
         }
+    }
+
+    #[test]
+    fn add_forge_requires_pr() {
+        assert!(Cli::try_parse_from(["wm", "add", "branch", "--forge", "gitlab"]).is_err());
+        let cli = Cli::try_parse_from(["wm", "add", "--pr", "123", "--forge", "gitlab"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Add {
+                forge: Some(Forge::Gitlab),
+                ..
+            }
+        ));
     }
 
     #[test]
