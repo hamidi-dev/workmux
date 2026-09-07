@@ -21,6 +21,10 @@ editUrl: https://github.com/raine/workmux/edit/main/CHANGELOG.md
 <!-- skipped: v0.1.25 -->
 <!-- skipped: v0.1.8 -->
 
+## v0.1.257 (2026-09-07)
+
+- Check out GitLab merge requests into worktrees with `workmux add --pr`, including self-hosted GitLab via MR URLs or `--forge gitlab`. Requires authenticated `glab` 1.37.0 or newer. ([#267](https://github.com/raine/workmux/issues/267))
+
 ## v0.1.256 (2026-09-06)
 
 - Resume an agent's previous session when recreating a worktree at the same path with `workmux add --continue`, optionally supplying a follow-up prompt.
