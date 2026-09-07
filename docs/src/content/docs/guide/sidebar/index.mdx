@@ -121,6 +121,11 @@ The left sidebar supports two layout modes, toggled with `v`:
 - **Tiles** (default): variable-height cards with status stripe
 - **Compact**: single line per agent
 
+Tiles show a muted `↓ N more` footer when agents remain below the visible area.
+The count includes only hidden agents, not agents above the viewport. The footer
+is not selectable and disappears when the final agent is visible. On very short
+sidebars, showing the selected tile takes priority over the footer.
+
 Your preference is persisted across tmux restarts. The top bar always uses a
 horizontal chip layout, so `v` has no effect there. Horizontal templates render
 as many configured lines as the current height allows.

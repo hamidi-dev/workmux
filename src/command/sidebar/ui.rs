@@ -804,6 +804,52 @@ fn render_compact_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
+/// Fully visible tiles and the space reserved for their overflow indicator.
+#[derive(Debug, PartialEq, Eq)]
+struct TileViewport {
+    start: usize,
+    end: usize,
+    more: bool,
+}
+
+fn tile_viewport(
+    heights: &[usize],
+    offset: usize,
+    selected: usize,
+    height: usize,
+) -> Option<TileViewport> {
+    let selected = selected.min(heights.len().checked_sub(1)?);
+    if heights[selected] > height {
+        return None;
+    }
+    let fit = |budget: usize, offset: usize| {
+        let mut start = offset.min(selected);
+        let mut rows: usize = heights[start..=selected].iter().sum();
+        while rows > budget && start < selected {
+            rows -= heights[start];
+            start += 1;
+        }
+        let mut end = selected + 1;
+        while end < heights.len() && rows + heights[end] <= budget {
+            rows += heights[end];
+            end += 1;
+        }
+        (start, end)
+    };
+    let (mut start, mut end) = fit(height, offset);
+    let mut more = end < heights.len() && heights[selected] < height;
+    if more {
+        (start, end) = fit(height - 1, offset);
+        // A shifted viewport can reach the end without needing an indicator.
+        let (_, full_end) = fit(height, start);
+        if full_end == heights.len() {
+            end = full_end;
+            more = false;
+        }
+    }
+    Some(TileViewport { start, end, more })
+}
+
 /// Tile layout: variable-height cards per agent with status stripe.
 fn render_tile_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
     if app.agents.is_empty() {
@@ -944,11 +990,37 @@ fn render_tile_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
         .collect();
 
     app.tile_heights = tile_heights;
+    let heights: Vec<_> = items.iter().map(ListItem::height).collect();
+    let viewport = tile_viewport(
+        &heights,
+        app.list_state.offset(),
+        app.list_state.selected().unwrap_or(app.list_state.offset()),
+        area.height as usize,
+    );
+    let more = viewport.as_ref().is_some_and(|view| view.more);
+    let list_area = Rect::new(area.x, area.y, area.width, area.height - u16::from(more));
+    if let Some(view) = &viewport {
+        *app.list_state.offset_mut() = view.start;
+        let visible_height: usize = heights[view.start..view.end].iter().sum();
+        app.list_area = Rect::new(area.x, area.y, area.width, visible_height as u16);
+    } else {
+        app.list_area = Rect::new(area.x, area.y, area.width, 0);
+    }
 
-    // No highlight_style - background is baked into content lines to avoid highlighting separators
-    let list = List::new(items);
+    // Selection backgrounds belong to tile content, not separators or the footer.
+    let list = List::new(items).scroll_padding(0);
+    f.render_stateful_widget(list, list_area, &mut app.list_state);
 
-    f.render_stateful_widget(list, area, &mut app.list_state);
+    if let Some(view) = viewport.filter(|view| view.more) {
+        let text = truncate_to_width(
+            &format!("↓ {} more", agent_count - view.end),
+            area.width as usize,
+        );
+        f.render_widget(
+            Line::from(Span::styled(text, Style::default().fg(app.palette.dimmed))),
+            Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        );
+    }
 }
 
 /// Get the status icon as parsed styled spans and the base style for an agent.
@@ -1064,6 +1136,166 @@ mod tests {
     use super::*;
     use crate::agent_display::{sanitize_pane_title, strip_oc_title_prefix};
     use crate::command::sidebar::app::TemplateError;
+
+    fn tile_fixture() -> SidebarApp {
+        use super::super::template::parser::parse_line;
+        use std::path::PathBuf;
+
+        let mut app = SidebarApp::test_with_template_error(TemplateError {
+            location: String::new(),
+            message: String::new(),
+        });
+        app.template_error = None;
+        app.dim_stale = false;
+        app.templates.compact =
+            parse_line("{status_icon} {primary} {pane_suffix} {fill} {elapsed}").unwrap();
+        for (idx, (project, name, status)) in [
+            ("api", "auth-refresh", AgentStatus::Working),
+            ("api", "rate-limit", AgentStatus::Waiting),
+            ("api", "rate-limit", AgentStatus::Done),
+            ("mobile", "ios-refactor-tests", AgentStatus::Working),
+            ("mobile", "ios-refactor-ui", AgentStatus::Waiting),
+            ("workmux", "sidebar-groups", AgentStatus::Working),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = PathBuf::from(format!("/example/{project}/{name}"));
+            app.agents.push(AgentPane {
+                session: project.to_string(),
+                window_name: format!("wm-{name}"),
+                pane_id: format!("%{idx}"),
+                window_id: format!("@{idx}"),
+                window_index: Some(idx as u32),
+                path,
+                pane_title: None,
+                status: Some(status),
+                status_ts: None,
+                activity_ts: None,
+                updated_ts: None,
+                window_cmd: None,
+                agent_command: None,
+                agent_kind: None,
+            });
+        }
+        app.list_state.select(Some(0));
+        app.host_agent_idx = Some(5);
+        app
+    }
+
+    fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    fn tile_app() -> SidebarApp {
+        let mut app = tile_fixture();
+        app.layout_mode = SidebarLayoutMode::Tiles;
+        app.templates.tiles = ["{primary}", "{secondary}", "{pane_title}"]
+            .into_iter()
+            .map(|line| super::super::template::parser::parse_line(line).unwrap())
+            .collect();
+        app
+    }
+
+    #[test]
+    fn tile_footer_counts_hidden_agents_and_has_no_mouse_target() {
+        let mut app = tile_app();
+        let mut terminal = Terminal::new(TestBackend::new(36, 12)).unwrap();
+        terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
+        assert_eq!(
+            buffer_row(terminal.backend().buffer(), 11).trim(),
+            "↓ 3 more"
+        );
+        assert_eq!(app.hit_test(1, 0), Some(0));
+        assert_eq!(app.hit_test(1, 4), Some(1));
+        assert_eq!(app.hit_test(1, 8), Some(2));
+        assert_eq!(app.hit_test(1, 11), None);
+        let offset = app.list_state.offset();
+        terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
+        assert_eq!(app.list_state.offset(), offset);
+
+        app.select_last();
+        terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
+        let text = (0..12)
+            .map(|y| buffer_row(terminal.backend().buffer(), y))
+            .collect::<String>();
+        assert!(!text.contains("more"));
+        assert!(text.contains("sidebar-groups"));
+        assert!((0..12).any(|y| app.hit_test(1, y) == Some(5)));
+        assert_eq!(app.hit_test(1, 11), None);
+    }
+
+    #[test]
+    fn tile_footer_uses_template_heights_and_respects_session_footer() {
+        let mut app = tile_app();
+        app.filter_mode = SidebarFilterMode::Session;
+        // Blank template lines do not consume tile rows.
+        app.templates.tiles[1].clear();
+        app.templates.tiles[2].clear();
+        app.agents.truncate(4);
+        let mut terminal = Terminal::new(TestBackend::new(36, 6)).unwrap();
+        terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
+        assert_eq!(
+            buffer_row(terminal.backend().buffer(), 4).trim(),
+            "↓ 2 more"
+        );
+        assert_eq!(
+            buffer_row(terminal.backend().buffer(), 5).trim(),
+            "[session]"
+        );
+        assert_eq!(app.hit_test(1, 3), None);
+        assert_eq!(app.hit_test(1, 4), None);
+        assert_eq!(app.hit_test(1, 5), None);
+    }
+
+    #[test]
+    fn tile_viewport_preserves_selection_and_stays_stable() {
+        for heights in [vec![3, 4, 4, 4, 5], vec![1, 2, 2, 3], vec![2, 6, 3, 1]] {
+            for height in 0..24 {
+                for selected in 0..heights.len() {
+                    for offset in 0..heights.len() + 2 {
+                        let view = tile_viewport(&heights, offset, selected, height);
+                        if heights[selected] > height {
+                            assert!(view.is_none());
+                            continue;
+                        }
+                        let view = view.unwrap();
+                        assert!(view.start <= selected && selected < view.end);
+                        let rows: usize = heights[view.start..view.end].iter().sum();
+                        assert!(rows + usize::from(view.more) <= height);
+                        assert_eq!(
+                            Some(&view),
+                            tile_viewport(&heights, view.start, selected, height).as_ref()
+                        );
+                        assert!(!view.more || view.end < heights.len());
+                    }
+                }
+            }
+        }
+        assert!(tile_viewport(&[], 0, 0, 10).is_none());
+    }
+
+    #[test]
+    fn tile_footer_disappears_when_agents_fit_and_never_hides_selection() {
+        let mut app = tile_app();
+        for height in 0..30 {
+            app.list_state.select(Some(0));
+            *app.list_state.offset_mut() = 0;
+            let mut terminal = Terminal::new(TestBackend::new(25, height)).unwrap();
+            terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
+            if height >= 3 {
+                assert!((0..height).any(|y| app.hit_test(1, y) == Some(0)));
+            }
+            if height >= 24 {
+                let text = (0..height)
+                    .map(|y| buffer_row(terminal.backend().buffer(), y))
+                    .collect::<String>();
+                assert!(!text.contains("more"));
+            }
+        }
+    }
 
     #[test]
     #[ignore = "manual performance benchmark"]
