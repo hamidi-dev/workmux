@@ -149,16 +149,6 @@ fn normalized_branch(branch: String) -> String {
     }
 }
 
-fn project_identity(worktree: &std::path::Path) -> (Option<String>, Option<PathBuf>) {
-    let Ok(root) = git::get_main_worktree_root_in(Some(worktree)) else {
-        return (None, None);
-    };
-    let project = root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned());
-    (project, Some(root))
-}
-
 fn status_entry(
     agent: &AgentPane,
     worktree: String,
@@ -166,7 +156,7 @@ fn status_entry(
     now: u64,
     git: Option<GitInfo>,
 ) -> StatusEntry {
-    let (project, project_path) = project_identity(&agent.path);
+    let (project, project_path) = git::project_identity(&agent.path);
     StatusEntry {
         worktree,
         branch,

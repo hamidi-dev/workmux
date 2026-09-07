@@ -131,22 +131,23 @@ impl AgentTargetParser {
         if let Ok(store) = crate::state::StateStore::new()
             && let Ok(agents) = store.load_reconciled_agents(mux.as_ref())
         {
+            let mut seen_roots = std::collections::HashSet::new();
             for agent in &agents {
                 let root = crate::workflow::find_worktree_root(&agent.path)
                     .unwrap_or_else(|| agent.path.clone());
+                if !seen_roots.insert(root.clone()) {
+                    continue;
+                }
                 if let Some(name) = root.file_name() {
                     let handle = name.to_string_lossy().to_string();
                     if !targets.contains(&handle) {
                         targets.push(handle.clone());
                     }
-                    // Also add qualified project:handle for disambiguation
-                    if let Some(parent) = root.parent()
-                        && let Some(proj) = parent.file_name()
+                    if let Some(qualified) =
+                        crate::workflow::AgentProject::for_worktree(&root).selector(&handle)
+                        && !targets.contains(&qualified)
                     {
-                        let qualified = format!("{}:{}", proj.to_string_lossy(), handle);
-                        if !targets.contains(&qualified) {
-                            targets.push(qualified);
-                        }
+                        targets.push(qualified);
                     }
                 }
             }

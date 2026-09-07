@@ -234,6 +234,68 @@ def test_status_all_json_reports_agents_across_repositories(
     assert by_workdir[str(second.worktree)]["project_path"] == str(second_repo)
 
 
+@pytest.mark.tmux_only
+def test_status_project_selector_round_trips_json_and_completions(
+    mux_server: MuxEnvironment, workmux_exe_path: Path, mux_repo_path: Path
+):
+    """JSON project names address agents from outside any repository."""
+    env = cast(TmuxEnvironment, mux_server)
+    runner = env.get_current_window()
+    assert runner is not None
+    agent = start_active_agent(
+        env, workmux_exe_path, mux_repo_path, "feature-project-selector"
+    )
+    stabilize_tmux_agent(env, agent)
+    env.select_window(runner)
+    outside = mux_repo_path.parent
+
+    result = run_workmux_command(
+        env,
+        workmux_exe_path,
+        mux_repo_path,
+        f"status --json {agent.branch}",
+        working_dir=outside,
+    )
+    entry = json.loads(result.stdout)["agents"][0]
+    assert entry["project"] == mux_repo_path.name
+    selector = f"{entry['project']}:{entry['worktree']}"
+    alias = f"{agent.worktree.parent.name}:{entry['worktree']}"
+
+    for target in [selector, alias]:
+        result = run_workmux_command(
+            env,
+            workmux_exe_path,
+            mux_repo_path,
+            f"status --json {target}",
+            working_dir=outside,
+        )
+        parsed = json.loads(result.stdout)
+        assert parsed["target_errors"] == []
+        assert len(parsed["agents"]) == 1
+        assert parsed["agents"][0]["workdir"] == entry["workdir"]
+        assert parsed["agents"][0]["project_path"] == entry["project_path"]
+
+    completions = run_workmux_command(
+        env,
+        workmux_exe_path,
+        mux_repo_path,
+        "_complete-agent-targets",
+        working_dir=outside,
+    ).stdout.splitlines()
+    assert selector in completions
+    assert alias not in completions
+    assert entry["worktree"] in completions
+
+    result = run_workmux_command(
+        env,
+        workmux_exe_path,
+        mux_repo_path,
+        f"send {selector} selector-smoke-test",
+        working_dir=outside,
+    )
+    assert result.exit_code == 0
+
+
 def test_status_json_fails_on_invalid_state(
     mux_server: MuxEnvironment, workmux_exe_path: Path, mux_repo_path: Path
 ):

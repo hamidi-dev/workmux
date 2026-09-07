@@ -519,6 +519,17 @@ pub fn remove_worktree_meta_at(handle: &str, git_common_dir: &Path) -> Result<()
     Ok(())
 }
 
+/// Main repository name and path used by agent selectors and status JSON.
+pub fn project_identity(path: &Path) -> (Option<String>, Option<PathBuf>) {
+    let Ok(root) = get_main_worktree_root_in(Some(path)) else {
+        return (None, None);
+    };
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    (name, Some(root))
+}
+
 /// Get the main worktree root directory (not a linked worktree)
 ///
 /// For bare repositories with linked worktrees, this returns the bare repo path.

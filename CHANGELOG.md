@@ -21,6 +21,10 @@ editUrl: https://github.com/raine/workmux/edit/main/CHANGELOG.md
 <!-- skipped: v0.1.25 -->
 <!-- skipped: v0.1.8 -->
 
+## Unreleased
+
+- Fix `project:handle` targets incorrectly reporting "No agent found" in `send`, `capture`, `status`, `wait`, and `run` with the default worktree directory layout. ([#269](https://github.com/raine/workmux/issues/269))
+
 ## v0.1.257 (2026-09-07)
 
 - Check out GitLab merge requests into worktrees with `workmux add --pr`, including self-hosted GitLab via MR URLs or `--forge gitlab`. Requires authenticated `glab` 1.37.0 or newer. ([#267](https://github.com/raine/workmux/issues/267))
