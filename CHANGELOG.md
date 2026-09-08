@@ -21,6 +21,10 @@ editUrl: https://github.com/raine/workmux/edit/main/CHANGELOG.md
 <!-- skipped: v0.1.25 -->
 <!-- skipped: v0.1.8 -->
 
+## Unreleased
+
+- Fix worktree removal abandoning cleanup when background processes keep writing files. Cleanup continues past individual failures and retries transient errors. If cleanup still fails, remaining files are in hidden `.workmux_trash_*` directories beside the original worktree, with exact paths recorded under `~/.local/state/workmux/pending-cleanup/` (or `$XDG_STATE_HOME/workmux/pending-cleanup/`).
+
 ## v0.1.258 (2026-09-07)
 
 - Fix `project:handle` targets incorrectly reporting "No agent found" in `send`, `capture`, `status`, `wait`, and `run` with default or custom worktree directory layouts. ([#269](https://github.com/raine/workmux/issues/269))
