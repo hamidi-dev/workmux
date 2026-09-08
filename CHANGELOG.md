@@ -21,9 +21,10 @@ editUrl: https://github.com/raine/workmux/edit/main/CHANGELOG.md
 <!-- skipped: v0.1.25 -->
 <!-- skipped: v0.1.8 -->
 
-## Unreleased
+## v0.1.259 (2026-09-08)
 
-- Fix worktree removal abandoning cleanup when background processes keep writing files. Cleanup continues past individual failures and retries transient errors. If cleanup still fails, remaining files are in hidden `.workmux_trash_*` directories beside the original worktree, with exact paths recorded under `~/.local/state/workmux/pending-cleanup/` (or `$XDG_STATE_HOME/workmux/pending-cleanup/`).
+- Show how many agents remain below the visible area in the sidebar's tile view.
+- Fix worktree cleanup giving up when background processes keep writing files: continue removing unrelated files, retry temporary failures, and retain recovery details if cleanup still fails.
 
 ## v0.1.258 (2026-09-07)
 
