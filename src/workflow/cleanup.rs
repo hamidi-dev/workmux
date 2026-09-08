@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -265,9 +265,9 @@ fn capture_worktree_identity(
 }
 
 #[derive(Clone, Copy)]
-struct DirectoryIdentity {
-    device: u64,
-    inode: u64,
+pub(super) struct DirectoryIdentity {
+    pub device: u64,
+    pub inode: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -314,7 +314,7 @@ fn directory_identity(metadata: &std::fs::Metadata) -> Result<DirectoryIdentity>
     }
 }
 
-fn metadata_matches(metadata: &std::fs::Metadata, expected: DirectoryIdentity) -> bool {
+pub(super) fn metadata_matches(metadata: &std::fs::Metadata, expected: DirectoryIdentity) -> bool {
     directory_identity(metadata)
         .map(|actual| actual.device == expected.device && actual.inode == expected.inode)
         .unwrap_or(false)
@@ -324,7 +324,24 @@ fn quarantine_worktree(
     worktree_path: &Path,
     expected: DirectoryIdentity,
     repository: Option<&git::RepositoryIdentity>,
-) -> Result<PathBuf> {
+) -> Result<super::cleanup_retry::PendingCleanup> {
+    let parent = worktree_path.parent().unwrap_or_else(|| Path::new("."));
+    let dir_name = worktree_path
+        .file_name()
+        .context("Invalid worktree path: no directory name")?;
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let trash_path = parent.join(format!(
+        ".workmux_trash_{}_{}_{}",
+        dir_name.to_string_lossy(),
+        std::process::id(),
+        nonce
+    ));
+
+    let pending =
+        super::cleanup_retry::PendingCleanup::prepare(worktree_path, trash_path.clone(), expected)?;
+
     // Identity is revalidated immediately before rename so path reuse cannot
     // redirect destructive cleanup to a different worktree.
     let metadata = std::fs::symlink_metadata(worktree_path)
@@ -343,20 +360,6 @@ fn quarantine_worktree(
         }
     }
 
-    let parent = worktree_path.parent().unwrap_or_else(|| Path::new("."));
-    let dir_name = worktree_path
-        .file_name()
-        .context("Invalid worktree path: no directory name")?;
-    let nonce = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)?
-        .as_nanos();
-    let trash_path = parent.join(format!(
-        ".workmux_trash_{}_{}_{}",
-        dir_name.to_string_lossy(),
-        std::process::id(),
-        nonce
-    ));
-
     // Renaming frees the original path for reuse while processes holding the
     // worktree as their CWD continue to refer to the quarantined directory.
     std::fs::rename(worktree_path, &trash_path).with_context(|| {
@@ -365,7 +368,7 @@ fn quarantine_worktree(
             trash_path.display()
         )
     })?;
-    Ok(trash_path)
+    Ok(pending)
 }
 
 fn perform_destructive_cleanup(
@@ -420,18 +423,8 @@ fn perform_destructive_cleanup(
     }
     git::remove_worktree_meta_at(handle, git_common_dir)
         .context("Failed to remove Workmux metadata after Git cleanup")?;
-    if let Some(trash_path) = quarantine {
-        std::fs::remove_dir_all(&trash_path).map_err(|error| {
-            let snapshot = super::cleanup_diagnostics::remaining_entries(&trash_path);
-            let context = format!(
-                "Failed to remove quarantined worktree {} (kind={:?}, errno={:?}); {}",
-                trash_path.display(),
-                error.kind(),
-                error.raw_os_error(),
-                snapshot,
-            );
-            anyhow::Error::new(error).context(context)
-        })?;
+    if let Some(pending) = quarantine {
+        pending.remove()?;
     }
     Ok(())
 }

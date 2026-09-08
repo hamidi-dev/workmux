@@ -1,4 +1,7 @@
+import json
 import shlex
+import subprocess
+import sys
 import shutil
 import uuid
 from pathlib import Path
@@ -1355,6 +1358,11 @@ def test_synchronous_metadata_lock_failure_reports_partial_cleanup(
     stderr = (scripts_dir / "workmux_remove_stderr.txt").read_text()
     assert "Removed worktree" not in stdout
     assert "Failed to remove Workmux metadata after Git cleanup" in stderr
+    pending = Path(env.env["XDG_STATE_HOME"]) / "workmux" / "pending-cleanup"
+    records = list(pending.glob("*.json"))
+    assert len(records) == 1
+    record = json.loads(records[0].read_text())
+    assert Path(record["quarantine_path"]).is_dir()
     metadata = env.run_command(
         [
             "git",
@@ -1604,3 +1612,106 @@ def test_deferred_worktree_lock_removal_failure_is_durably_logged(
     assert lock_path.is_file()
     assert worktree_path.is_dir()
     admin_dir.chmod(0o755)
+
+
+@pytest.mark.tmux_only
+@pytest.mark.parametrize(
+    "persistent", [False, True], ids=["writer-stops", "writer-persists"]
+)
+def test_deferred_cleanup_with_surviving_writer(
+    mux_server: TmuxEnvironment,
+    workmux_exe_path: Path,
+    mux_repo_path: Path,
+    persistent: bool,
+):
+    """Detached writes are retried; exhausted cleanup retains an identity record."""
+    env = mux_server
+    branch = "cleanup-writer"
+    write_workmux_config(mux_repo_path)
+    run_workmux_add(env, workmux_exe_path, mux_repo_path, branch)
+    tree = get_worktree_path(mux_repo_path, branch)
+    build = tree / "target" / "debug" / "build"
+    build.mkdir(parents=True)
+    for i in range(100):
+        directory = build / f"crate-{i}"
+        directory.mkdir()
+        for j in range(100):
+            (directory / f"file-{j}").touch()
+    ready = env.tmp_path / "writer-ready"
+    stop = env.tmp_path / "writer-stop"
+    writer = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            """
+import pathlib, sys, time
+ready, stop, original = map(pathlib.Path, sys.argv[1:4])
+ready.touch()
+renamed_at = None
+deadline = time.monotonic() + 30
+while not stop.exists() and time.monotonic() < deadline:
+    if not original.exists() and renamed_at is None:
+        renamed_at = time.monotonic()
+    if sys.argv[4] == 'False' and renamed_at is not None:
+        if time.monotonic() - renamed_at > 1:
+            break
+    try:
+        directory = pathlib.Path('target/debug/build/churn')
+        directory.mkdir(parents=True, exist_ok=True)
+        for i in range(200):
+            (directory / f'file-{i}').touch()
+    except OSError:
+        pass
+""",
+            str(ready),
+            str(stop),
+            str(tree),
+            str(persistent),
+        ],
+        cwd=tree,
+        env=env.env,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert poll_until(ready.exists)
+        output = env.tmp_path / "cleanup-writer-output"
+        command = (
+            f"cd {shlex.quote(str(tree))} && "
+            f"{shlex.quote(str(workmux_exe_path))} remove --force {branch} "
+            f">{shlex.quote(str(output))} 2>&1"
+        )
+        env.send_keys(get_window_name(branch), command)
+        assert poll_until(
+            lambda: output.exists() and "Scheduled removal" in output.read_text()
+        )
+        state = Path(env.env["XDG_STATE_HOME"]) / "workmux"
+        pending = state / "pending-cleanup"
+        log = state / "workmux.log"
+        if persistent:
+            assert poll_until(
+                lambda: log.exists()
+                and "pending cleanup record retained at" in log.read_text(),
+                timeout=15,
+            )
+            records = list(pending.glob("*.json"))
+            assert len(records) == 1
+            record = json.loads(records[0].read_text())
+            trash = Path(record["quarantine_path"])
+            assert trash.is_dir()
+            assert trash.stat().st_ino == record["inode"]
+            assert trash.stat().st_dev == record["device"]
+            assert "DirectoryNotEmpty" in log.read_text()
+            assert "post-failure snapshot" in log.read_text()
+        else:
+            assert poll_until(
+                lambda: not tree.exists()
+                and not list(tree.parent.glob(f".workmux_trash_{branch}_*"))
+                and not list(pending.glob("*.json")),
+                timeout=15,
+            )
+    finally:
+        stop.touch()
+        writer.terminate()
+        writer.wait(timeout=5)

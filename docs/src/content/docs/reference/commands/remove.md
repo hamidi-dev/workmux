@@ -55,3 +55,25 @@ workmux rm --gone -f
 # Remove all worktrees at once
 workmux rm --all
 ```
+
+## Deferred filesystem cleanup
+
+When removing a worktree from its own terminal target, filesystem cleanup runs
+in a detached worker after that target closes. Surviving background processes
+can still write into the renamed `.workmux_trash_*` directory. Workmux retries
+`DirectoryNotEmpty` errors with backoff for a five-second retry window; an
+individual recursive deletion can take longer. It does not kill those processes.
+
+Before renaming the worktree, Workmux saves a pending filesystem-cleanup record
+under `$XDG_STATE_HOME/workmux/pending-cleanup/` (by default,
+`~/.local/state/workmux/pending-cleanup/`). The record includes the original and
+quarantine paths and the captured directory's device and inode. It is cleared
+only after filesystem deletion succeeds.
+
+If deletion fails, the record remains and the worker writes the error and a
+bounded snapshot of remaining entries to `workmux.log` in the same state directory.
+Records also survive failures in intervening Git operations. They are diagnostic
+recovery records, not an automatic cleanup queue: inspect them and stop any
+remaining writers before manually recovering the exact quarantined directory.
+Do not replay branch deletion from a record, since Git cleanup may already have
+completed and the original branch or worktree path may have been reused.

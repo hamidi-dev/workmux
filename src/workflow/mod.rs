@@ -2,6 +2,7 @@
 mod agent_resolve;
 mod cleanup;
 mod cleanup_diagnostics;
+mod cleanup_retry;
 mod context;
 mod create;
 pub mod file_ops;
