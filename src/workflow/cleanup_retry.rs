@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::cleanup::{DirectoryIdentity, metadata_matches};
+use super::cleanup::DirectoryIdentity;
 
 const RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
@@ -92,20 +92,7 @@ fn remove_with_retry(
     identity: DirectoryIdentity,
     timeout: Duration,
 ) -> io::Result<()> {
-    retry_directory_not_empty(timeout, || {
-        // Each attempt must still target the captured directory, not a reused path.
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        if metadata.is_symlink() || !metadata.is_dir() || !metadata_matches(&metadata, identity) {
-            return Err(io::Error::other(
-                "Quarantined worktree identity changed before deletion",
-            ));
-        }
-        std::fs::remove_dir_all(path)
-    })
+    retry_directory_not_empty(timeout, || super::cleanup_tree::remove(path, identity))
 }
 
 fn retry_directory_not_empty(

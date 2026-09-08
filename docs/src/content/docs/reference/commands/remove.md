@@ -60,7 +60,9 @@ workmux rm --all
 
 When removing a worktree from its own terminal target, filesystem cleanup runs
 in a detached worker after that target closes. Surviving background processes
-can still write into the renamed `.workmux_trash_*` directory. Workmux retries
+can still write into the renamed `.workmux_trash_*` directory. Rust cleanup
+continues deleting unrelated files and directories after an individual failure,
+using descriptor-relative operations without following symlink targets. Workmux retries
 `DirectoryNotEmpty` errors with backoff for a five-second retry window; an
 individual recursive deletion can take longer. It does not kill those processes.
 
@@ -71,7 +73,8 @@ quarantine paths and the captured directory's device and inode. It is cleared
 only after filesystem deletion succeeds.
 
 If deletion fails, the record remains and the worker writes the error and a
-bounded snapshot of remaining entries to `workmux.log` in the same state directory.
+bounded snapshot of remaining entries, along with the paths and errors from
+failed deletion operations, to `workmux.log` in the same state directory.
 Records also survive failures in intervening Git operations. They are diagnostic
 recovery records, not an automatic cleanup queue: inspect them and stop any
 remaining writers before manually recovering the exact quarantined directory.

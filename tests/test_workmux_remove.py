@@ -1702,7 +1702,11 @@ while not stop.exists() and time.monotonic() < deadline:
             assert trash.is_dir()
             assert trash.stat().st_ino == record["inode"]
             assert trash.stat().st_dev == record["device"]
-            assert "DirectoryNotEmpty" in log.read_text()
+            assert "Directory not empty" in log.read_text()
+            assert "Recursive deletion encountered" in log.read_text()
+            assert not list(trash.rglob("crate-*")), (
+                "Busy directory must not block sibling cleanup"
+            )
             assert "post-failure snapshot" in log.read_text()
         else:
             assert poll_until(

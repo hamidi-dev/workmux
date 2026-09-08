@@ -56,7 +56,7 @@ notify-rust = "4"
 libc = "0.2"
 ctrlc = "3.5"
 base64 = "0.22"
-nix = { version = "0.31.2", features = ["fs"] }
+nix = { version = "0.31.2", features = ["fs", "dir"] }
 tempfile = "3.27"
 getrandom = "0.4.2"
 similar = "3"
