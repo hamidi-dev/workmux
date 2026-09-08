@@ -421,11 +421,16 @@ fn perform_destructive_cleanup(
     git::remove_worktree_meta_at(handle, git_common_dir)
         .context("Failed to remove Workmux metadata after Git cleanup")?;
     if let Some(trash_path) = quarantine {
-        std::fs::remove_dir_all(&trash_path).with_context(|| {
-            format!(
-                "Failed to remove quarantined worktree {}",
-                trash_path.display()
-            )
+        std::fs::remove_dir_all(&trash_path).map_err(|error| {
+            let snapshot = super::cleanup_diagnostics::remaining_entries(&trash_path);
+            let context = format!(
+                "Failed to remove quarantined worktree {} (kind={:?}, errno={:?}); {}",
+                trash_path.display(),
+                error.kind(),
+                error.raw_os_error(),
+                snapshot,
+            );
+            anyhow::Error::new(error).context(context)
         })?;
     }
     Ok(())
