@@ -44,7 +44,7 @@ class TestDryRun:
             post_create=[f"touch {hook_file}"],
             base_branch="main",
         )
-        windows_before = env.list_windows()
+        windows_before = env.list_window_ids()
 
         result = run_workmux_command(
             env,
@@ -62,7 +62,7 @@ class TestDryRun:
         assert f"touch {hook_file}" in result.stdout
         assert not worktree_path.exists()
         assert not hook_file.exists()
-        assert env.list_windows() == windows_before
+        assert env.list_window_ids() == windows_before
         branches = env.run_command(["git", "branch", "--list", branch_name])
         assert branches.stdout.strip() == ""
 
@@ -98,7 +98,7 @@ class TestDryRun:
             "this-output-contains-far-too-many-words-to-be-a-concise-branch-name"
         )
         worktree_path = get_worktree_path(mux_repo_path, generated_name)
-        windows_before = env.list_windows()
+        windows_before = env.list_window_ids()
         write_global_workmux_config(
             env,
             auto_name={
@@ -116,7 +116,7 @@ class TestDryRun:
 
         assert "after 2 attempts" in result.stderr
         assert not worktree_path.exists()
-        assert env.list_windows() == windows_before
+        assert env.list_window_ids() == windows_before
 
     def test_auto_name_treats_remote_prefix_as_local_branch(
         self, mux_server: MuxEnvironment, workmux_exe_path, mux_repo_path

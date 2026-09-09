@@ -7,11 +7,13 @@ which is set up via set-window-status.
 """
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from .conftest import (
     MuxEnvironment,
+    TmuxEnvironment,
     poll_until,
     run_workmux_add,
     run_workmux_command,
@@ -121,9 +123,8 @@ def test_send_codex_prompt_uses_bracketed_paste(
     tmp_path: Path,
 ):
     """Codex prompts submit through bracketed paste instead of a typed burst."""
-    env = mux_server
-    command_window = env.get_current_window()
-    assert command_window is not None
+    env = cast(TmuxEnvironment, mux_server)
+    command_window = env.tmux(["display-message", "-p", "#{window_id}"]).stdout.strip()
     agent = start_active_agent(
         env,
         workmux_exe_path,

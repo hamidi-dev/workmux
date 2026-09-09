@@ -672,7 +672,9 @@ def test_status_update_preserves_state_when_tmux_boot_id_is_unavailable(
             {"PATH": f"{wrapper_dir}:{env.env['PATH']}"},
         ),
     )
-    assert poll_until(lambda: marker.exists(), timeout=5.0)
+    assert poll_until(lambda: marker.exists(), timeout=5.0), env.capture_pane(
+        agent.window
+    )
 
     assert read_agent_state(state_file) == state
 
@@ -725,7 +727,9 @@ def test_status_update_preserves_state_when_tmux_pane_pid_is_unavailable(
             {"PATH": f"{wrapper_dir}:{env.env['PATH']}"},
         ),
     )
-    assert poll_until(lambda: marker.exists(), timeout=5.0)
+    assert poll_until(lambda: marker.exists(), timeout=5.0), env.capture_pane(
+        agent.window
+    )
 
     assert read_agent_state(state_file) == state
 

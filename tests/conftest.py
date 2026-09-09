@@ -255,6 +255,11 @@ class MuxEnvironment(ABC):
         pass
 
     @abstractmethod
+    def list_window_ids(self) -> list[str]:
+        """Return stable window/tab identities, independent of automatic titles."""
+        pass
+
+    @abstractmethod
     def capture_pane(self, window_name: str) -> Optional[str]:
         """Capture the content of a pane in the specified window."""
         pass
@@ -368,6 +373,12 @@ class TmuxEnvironment(MuxEnvironment):
         """List all tmux window names."""
         result = self.mux_command(["list-windows", "-F", "#{window_name}"])
         return [w for w in result.stdout.strip().split("\n") if w]
+
+    def list_window_ids(self) -> list[str]:
+        """List tmux window IDs, which survive automatic renaming."""
+        return self.mux_command(
+            ["list-windows", "-F", "#{window_id}"]
+        ).stdout.splitlines()
 
     def capture_pane(self, window_name: str) -> Optional[str]:
         """Capture pane content from a tmux window."""
@@ -511,6 +522,10 @@ class WezTermEnvironment(MuxEnvironment):
                 seen.add(title)
                 result.append(title)
         return result
+
+    def list_window_ids(self) -> list[str]:
+        """List distinct tab IDs in workspace order."""
+        return list(dict.fromkeys(str(p["tab_id"]) for p in self._list_panes()))
 
     def _find_pane_by_tab_title(self, tab_title: str) -> Optional[dict]:
         """Find a pane by its tab title."""
@@ -1484,7 +1499,7 @@ def make_env_script(env: MuxEnvironment, command: str, env_vars: dict[str, str])
         env_vars: Environment variables to set (e.g., {"XDG_STATE_HOME": "/path"})
 
     Returns:
-        Path to the script file (as string) that can be passed to send_keys
+        Shell command that can be passed to send_keys
     """
     global _script_counter
     _script_counter += 1
@@ -1497,7 +1512,9 @@ def make_env_script(env: MuxEnvironment, command: str, env_vars: dict[str, str])
 """
     script_file.write_text(script_content)
     script_file.chmod(0o755)
-    return str(script_file)
+    # Invoke the interpreter directly: cold shebang execution on macOS can
+    # stall before the script body starts, consuming the command's wait budget.
+    return f"/bin/sh {shlex.quote(str(script_file))}"
 
 
 def get_session_name(branch_name: str) -> str:

@@ -240,8 +240,7 @@ def test_status_project_selector_round_trips_json_and_completions(
 ):
     """JSON project names address agents from outside any repository."""
     env = cast(TmuxEnvironment, mux_server)
-    runner = env.get_current_window()
-    assert runner is not None
+    runner = env.tmux(["display-message", "-p", "#{window_id}"]).stdout.strip()
     agent = start_active_agent(
         env, workmux_exe_path, mux_repo_path, "feature-project-selector"
     )
