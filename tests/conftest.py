@@ -1587,8 +1587,9 @@ def run_workmux_command(
 
     # Write the command to a script file to avoid tmux send-keys line length limits.
     # The PATH can be very long in test environments, causing command truncation.
+    exit_trap = f"echo $? > {shlex.quote(str(exit_code_file))}"
     script_content = f"""#!/bin/sh
-trap 'echo $? > {shlex.quote(str(exit_code_file))}' EXIT
+trap {shlex.quote(exit_trap)} EXIT
 export PATH={shlex.quote(env.env["PATH"])}
 export TMPDIR={shlex.quote(env.env.get("TMPDIR", "/tmp"))}
 export HOME={shlex.quote(env.env.get("HOME", ""))}
@@ -1600,8 +1601,9 @@ export WORKMUX_TEST=1
     script_file.write_text(script_content)
     script_file.chmod(0o755)
 
-    # Execute the script - this keeps the send_keys command short
-    env.send_keys("test:", str(script_file), enter=True)
+    # Read the script through its interpreter, avoiding cold shebang startup
+    # delays before the command can execute (as in make_env_script).
+    env.send_keys("test:", f"/bin/sh {shlex.quote(str(script_file))}", enter=True)
 
     if not poll_until_file_has_content(exit_code_file, timeout=timeout):
         # Capture pane content for debugging

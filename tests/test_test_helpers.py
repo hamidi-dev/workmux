@@ -9,6 +9,7 @@ from .conftest import (
     WezTermEnvironment,
     make_env_script,
     poll_until,
+    run_workmux_command,
 )
 
 
@@ -73,3 +74,41 @@ def test_wezterm_window_ids_distinguish_tabs_not_titles(
         ],
     )
     assert env.list_window_ids() == ["7", "8"]
+
+
+@pytest.mark.parametrize("exit_code", [0, 17])
+def test_workmux_command_reads_script_through_interpreter(
+    mux_server, repo_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
+):
+    """The terminal runner reads its script and preserves command IO and status."""
+    env = mux_server
+    scripts = env.tmp_path / "scripts with 'quotes'"
+    scripts.mkdir()
+    env._scripts_dir = scripts
+    send_keys = env.send_keys
+
+    def send_without_execute_permission(target, text, enter=True):
+        (scripts / "workmux_run.sh").chmod(0o644)
+        send_keys(target, text, enter=enter)
+
+    monkeypatch.setattr(env, "send_keys", send_without_execute_permission)
+    result = run_workmux_command(
+        env,
+        Path("/bin/sh"),
+        repo_path,
+        '-c \'read -r input; printf "%s\\n" "$input" "$HARNESS_VALUE"; '
+        f"pwd; printf error >&2; exit {exit_code}'",
+        stdin_input="literal input\n",
+        pre_run_env={"HARNESS_VALUE": "spaces and $literal"},
+        working_dir=scripts,
+        expect_fail=exit_code != 0,
+    )
+
+    assert result.exit_code == exit_code
+    assert result.stdout.splitlines() == [
+        "literal input",
+        "spaces and $literal",
+        str(scripts.resolve()),
+    ]
+    assert result.stderr == "error"
+    assert "HARNESS_VALUE" not in env.env
