@@ -63,6 +63,22 @@ Key flags:
 - `--foreach <matrix>`: create worktrees from variable matrix
 - `--no-hooks, --no-file-ops, --no-pane-cmds`: skip setup steps
 
+### Create without a multiplexer
+
+```bash
+workmux add <branch-name> --headless --json
+```
+
+Runs file operations and post-create hooks without creating a window or
+starting an agent. No running multiplexer is required. `--json` requires
+`--headless` and returns one JSON receipt with the handle, worktree path,
+and effective working directory; hook output goes to stderr.
+
+Use an explicit local branch name. Supports `--base`, `--name`, `--no-hooks`,
+and `--no-file-ops`, but not PR checkout, prompts, `--background`, or other
+mux/agent options. Worktrees persist until removed: clean up with
+`workmux remove <handle>` or attach a window later with `workmux open <handle>`.
+
 ### List worktrees
 
 ```bash
