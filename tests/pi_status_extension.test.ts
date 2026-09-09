@@ -3,49 +3,117 @@ import { describe, expect, test } from 'bun:test';
 import workmuxStatusExtension from '../resources/pi/extensions/workmux-status';
 
 type Handler = (event: unknown, context: unknown) => Promise<void> | void;
+type Listener = (data: unknown) => Promise<void> | void;
 type AssistantMessage = {
   role: 'assistant';
   stopReason: string;
   errorMessage?: string;
 };
 
-function createHarness(initialMessage: AssistantMessage) {
-  const handlers = new Map<string, Handler>();
-  const statuses: string[] = [];
-  let branch = [{ type: 'message', message: initialMessage }];
-
-  const pi = {
-    exec: async (_command: string, args: string[]) => {
-      if (args[0] === 'set-window-status') {
-        statuses.push(args[1]);
-      }
-      return { stdout: '', stderr: '', code: 0, killed: false };
-    },
-    on: (name: string, handler: Handler) => handlers.set(name, handler),
-  };
-  workmuxStatusExtension(pi as never);
-
-  return {
-    statuses,
-    setMessage(message: AssistantMessage) {
-      branch = [...branch, { type: 'message', message }];
-    },
-    async emit(name: string) {
-      await handlers.get(name)?.({}, {
-        sessionManager: { getBranch: () => branch },
-      });
-    },
-  };
-}
-
 const stoppedMessage = (): AssistantMessage => ({
   role: 'assistant',
   stopReason: 'stop',
 });
 
+const abortedMessages: AssistantMessage[] = [
+  { role: 'assistant', stopReason: 'aborted' },
+  { role: 'assistant', stopReason: 'error', errorMessage: 'The operation was aborted.' },
+];
+
+async function createHarness(
+  initialMessage = stoppedMessage(),
+  options: {
+    snapshot?: number;
+    idle?: boolean;
+    exec?: (args: string[]) => Promise<number>;
+  } = {},
+) {
+  const handlers = new Map<string, Handler>();
+  const listeners = new Map<string, Set<Listener>>();
+  const pending = new Set<Promise<void>>();
+  const calls: string[][] = [];
+  const statuses: string[] = [];
+  let branch = [{ type: 'message', message: initialMessage }];
+  let idle = options.idle ?? true;
+  const events = {
+    on(name: string, listener: Listener) {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name)!.add(listener);
+      return () => { listeners.get(name)!.delete(listener); };
+    },
+    emit(name: string, data: unknown) {
+      // Pi invokes listeners synchronously but does not await their promises.
+      for (const listener of listeners.get(name) ?? []) {
+        const promise = Promise.resolve(listener(data));
+        pending.add(promise);
+        void promise.finally(() => pending.delete(promise));
+      }
+    },
+  };
+  let stopPublisher: (() => void) | undefined;
+  if (options.snapshot !== undefined) {
+    stopPublisher = events.on('suba:activity:request', () => {
+      events.emit('suba:activity', { activeCount: options.snapshot });
+    });
+  }
+  const pi = {
+    events,
+    exec: async (_command: string, args: string[]) => {
+      calls.push(args);
+      const code = await options.exec?.(args) ?? 0;
+      if (args[0] === 'set-window-status' && code === 0) statuses.push(args[1]);
+      return { stdout: '', stderr: '', code, killed: false };
+    },
+    on: (name: string, handler: Handler) => handlers.set(name, handler),
+  };
+  workmuxStatusExtension(pi as never);
+
+  const harness = {
+    calls,
+    statuses,
+    events,
+    listeners,
+    stopPublisher() { stopPublisher?.(); },
+    async flush() {
+      while (pending.size) await Promise.all([...pending]);
+    },
+    async activity(activeCount: number) {
+      events.emit('suba:activity', { activeCount });
+      await this.flush();
+    },
+    setMessage(message: AssistantMessage) {
+      branch = [...branch, { type: 'message', message }];
+    },
+    async emit(name: string, isIdle?: boolean) {
+      if (name === 'agent_start') idle = false;
+      if (name === 'agent_settled') idle = true;
+      if (isIdle !== undefined) idle = isIdle;
+      await handlers.get(name)?.({}, {
+        isIdle: () => idle,
+        sessionManager: { getBranch: () => branch },
+      });
+    },
+  };
+  await harness.emit('session_start');
+  return harness;
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 describe('pi workmux status extension', () => {
+  test('registers without changing status when no publisher is present', async () => {
+    const harness = await createHarness();
+    expect(harness.calls).toEqual([['register-agent']]);
+    await harness.emit('session_shutdown');
+    expect(harness.statuses).toEqual([]);
+  });
+
   test('reports done only after the full agent run settles', async () => {
-    const harness = createHarness(stoppedMessage());
+    const harness = await createHarness();
 
     await harness.emit('agent_start');
     await harness.emit('agent_end');
@@ -55,18 +123,8 @@ describe('pi workmux status extension', () => {
     expect(harness.statuses).toEqual(['working', 'done']);
   });
 
-  test.each([
-    {
-      role: 'assistant' as const,
-      stopReason: 'aborted',
-    },
-    {
-      role: 'assistant' as const,
-      stopReason: 'error',
-      errorMessage: 'The operation was aborted.',
-    },
-  ])('stays working after an aborted turn', async (message) => {
-    const harness = createHarness(message);
+  test.each(abortedMessages)('stays working after an aborted turn without a publisher', async (message) => {
+    const harness = await createHarness(message);
 
     await harness.emit('agent_start');
     await harness.emit('agent_settled');
@@ -75,11 +133,7 @@ describe('pi workmux status extension', () => {
   });
 
   test('reports done after the continuation completes', async () => {
-    const harness = createHarness({
-      role: 'assistant',
-      stopReason: 'error',
-      errorMessage: 'The operation was aborted.',
-    });
+    const harness = await createHarness(abortedMessages[1]);
 
     await harness.emit('agent_start');
     await harness.emit('agent_settled');
@@ -88,5 +142,211 @@ describe('pi workmux status extension', () => {
     await harness.emit('agent_settled');
 
     expect(harness.statuses).toEqual(['working', 'working', 'done']);
+  });
+
+  test('ordinary errors still report done without a publisher', async () => {
+    const harness = await createHarness({
+      role: 'assistant', stopReason: 'error', errorMessage: 'Provider unavailable',
+    });
+    await harness.emit('agent_start');
+    await harness.emit('agent_settled');
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test.each([0, 2])('requests a restored snapshot after registration (%i children)', async (snapshot) => {
+    const harness = await createHarness(stoppedMessage(), { snapshot });
+    expect(harness.calls).toEqual([
+      ['register-agent'],
+      ['set-window-status', snapshot > 0 ? 'working' : 'done'],
+    ]);
+  });
+
+  test('accepts a publisher starting after the consumer', async () => {
+    const harness = await createHarness();
+    await harness.activity(2);
+    expect(harness.statuses).toEqual(['working']);
+  });
+
+  test('restoring children does not hide an already active parent', async () => {
+    const harness = await createHarness(stoppedMessage(), { snapshot: 0, idle: false });
+    expect(harness.statuses).toEqual(['working']);
+  });
+
+  test('keeps working until every concurrent child becomes inactive', async () => {
+    const harness = await createHarness();
+    await harness.emit('agent_start');
+    await harness.activity(2);
+    await harness.emit('agent_end');
+    await harness.emit('agent_settled');
+    await harness.activity(1);
+    await harness.activity(1);
+    expect(harness.statuses).toEqual(['working']);
+    await harness.activity(0);
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test('keeps working while the parent runs after the last child stops', async () => {
+    const harness = await createHarness();
+    await harness.activity(1);
+    await harness.emit('agent_start');
+    await harness.activity(0);
+    await harness.emit('agent_end');
+    expect(harness.statuses).toEqual(['working']);
+    await harness.emit('agent_settled');
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test('does not settle a parent run started by another extension', async () => {
+    const harness = await createHarness();
+    await harness.emit('agent_start');
+    await harness.activity(0);
+    await harness.emit('agent_settled', false);
+    expect(harness.statuses).toEqual(['working']);
+    await harness.emit('agent_settled');
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test('waiting children stop contributing and resume without a parent turn', async () => {
+    const harness = await createHarness();
+    await harness.activity(1);
+    await harness.activity(0);
+    await harness.activity(1);
+    await harness.activity(0);
+    expect(harness.statuses).toEqual(['working', 'done', 'working', 'done']);
+  });
+
+  test.each(abortedMessages)('settled aborts are inactive with an authoritative publisher', async (message) => {
+    const harness = await createHarness(message);
+    await harness.emit('agent_start');
+    await harness.activity(1);
+    await harness.emit('agent_settled');
+    expect(harness.statuses).toEqual(['working']);
+    await harness.activity(0);
+    expect(harness.statuses).toEqual(['working', 'done']);
+    harness.setMessage(stoppedMessage());
+    await harness.emit('agent_start');
+    await harness.emit('agent_settled');
+    expect(harness.statuses).toEqual(['working', 'done', 'working', 'done']);
+  });
+
+  test('a late publisher clears the ordinary aborted-continuation status', async () => {
+    const harness = await createHarness(abortedMessages[0]);
+    await harness.emit('agent_start');
+    await harness.emit('agent_settled');
+    await harness.activity(0);
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test('ignores malformed snapshots without enabling aggregate behavior', async () => {
+    const harness = await createHarness(abortedMessages[0]);
+    await harness.emit('agent_start');
+    for (const data of [null, undefined, 2, {}, { activeCount: '1' },
+      { activeCount: -1 }, { activeCount: 0.5 }, { activeCount: NaN },
+      { activeCount: Infinity }, { activeCount: Number.MAX_SAFE_INTEGER + 1 }]) {
+      harness.events.emit('suba:activity', data);
+    }
+    await harness.flush();
+    await harness.emit('agent_settled');
+    expect(harness.statuses).toEqual(['working']);
+  });
+
+  test('serializes overlapping child and parent status commands', async () => {
+    const gate = deferred();
+    const started = deferred();
+    const harness = await createHarness(stoppedMessage(), {
+      async exec(args) {
+        if (args[1] === 'working') {
+          started.resolve();
+          await gate.promise;
+        }
+        return 0;
+      },
+    });
+    harness.events.emit('suba:activity', { activeCount: 1 });
+    await started.promise;
+    harness.events.emit('suba:activity', { activeCount: 0 });
+    const parentStart = harness.emit('agent_start');
+    expect(harness.calls).toEqual([['register-agent'], ['set-window-status', 'working']]);
+    gate.resolve();
+    await parentStart;
+    await harness.flush();
+    expect(harness.statuses).toEqual(['working', 'done', 'working']);
+  });
+
+  test.each(['reject', 'nonzero'])('a %s command failure does not poison later writes', async (failure) => {
+    let attempts = 0;
+    const harness = await createHarness(stoppedMessage(), {
+      async exec(args) {
+        if (args[0] === 'set-window-status' && attempts++ === 0) {
+          if (failure === 'reject') throw new Error('workmux unavailable');
+          return 1;
+        }
+        return 0;
+      },
+    });
+    await harness.activity(1);
+    await harness.activity(1);
+    await harness.activity(0);
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test('registration failure does not prevent status updates', async () => {
+    const harness = await createHarness(stoppedMessage(), {
+      async exec(args) {
+        if (args[0] === 'register-agent') throw new Error('not in tmux');
+        return 0;
+      },
+    });
+    await harness.activity(1);
+    await harness.activity(0);
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test('shutdown drains pending writes, clears activity, and removes its listener', async () => {
+    const gate = deferred();
+    const started = deferred();
+    const harness = await createHarness(stoppedMessage(), {
+      async exec(args) {
+        if (args[1] === 'working') {
+          started.resolve();
+          await gate.promise;
+        }
+        return 0;
+      },
+    });
+    harness.events.emit('suba:activity', { activeCount: 1 });
+    await started.promise;
+    let stopped = false;
+    const shutdown = harness.emit('session_shutdown').then(() => { stopped = true; });
+    await harness.emit('agent_start');
+    harness.events.emit('suba:activity', { activeCount: 2 });
+    expect(stopped).toBe(false);
+    expect(harness.listeners.get('suba:activity')!.size).toBe(0);
+    gate.resolve();
+    await shutdown;
+    await harness.flush();
+    await harness.emit('session_shutdown');
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test('session replacement discards child counts and ordinary abort behavior returns', async () => {
+    const harness = await createHarness(abortedMessages[0], { snapshot: 2 });
+    await harness.emit('session_shutdown');
+    harness.stopPublisher();
+    await harness.emit('session_start');
+    await harness.emit('agent_start');
+    await harness.emit('agent_settled');
+    expect(harness.statuses).toEqual(['working', 'done', 'working']);
+    expect(harness.listeners.get('suba:activity')!.size).toBe(1);
+  });
+
+  test('reload requests a fresh snapshot and does not accumulate listeners', async () => {
+    const harness = await createHarness(stoppedMessage(), { snapshot: 2 });
+    await harness.emit('session_shutdown');
+    await harness.emit('session_start');
+    expect(harness.statuses).toEqual(['working', 'done', 'working']);
+    expect(harness.listeners.get('suba:activity')!.size).toBe(1);
+    await harness.activity(0);
+    expect(harness.statuses.at(-1)).toBe('done');
   });
 });

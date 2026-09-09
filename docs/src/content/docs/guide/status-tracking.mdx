@@ -85,6 +85,23 @@ curl -o ~/.pi/agent/extensions/workmux-status.ts \
 
 Restart pi for the extension to take effect.
 
+### Pi subagents
+
+With a [pi-suba](https://github.com/raine/pi-suba) release that publishes activity
+snapshots, the parent stays working while either the parent or any delegated child
+is active. Waiting children do not count as active. When both the parent and all
+children are inactive, workmux reports done. Resuming a child marks the parent
+working again, even without a new parent turn.
+
+The extensions communicate through `pi.events`: pi-suba publishes
+`suba:activity` with `{ activeCount: number }`, and workmux requests an initial
+snapshot with `suba:activity:request`. Workmux does not read child session files or
+poll child processes.
+
+Without an activity publisher, Pi status behavior is unchanged, including keeping
+aborted turns working for continuation. With a publisher, a settled aborted parent
+is inactive, but active children still keep it working.
+
 ## Oh My Pi setup
 
 If you prefer manual setup, copy the workmux status extension to your global OMP extensions directory:
