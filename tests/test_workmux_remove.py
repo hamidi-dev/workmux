@@ -1624,7 +1624,7 @@ def test_deferred_cleanup_with_surviving_writer(
     mux_repo_path: Path,
     persistent: bool,
 ):
-    """Detached writes are retried; exhausted cleanup retains an identity record."""
+    """Detached writes allow cleanup; permanent failures retain an identity record."""
     env = mux_server
     branch = "cleanup-writer"
     write_workmux_config(mux_repo_path)
@@ -1637,6 +1637,13 @@ def test_deferred_cleanup_with_surviving_writer(
         directory.mkdir()
         for j in range(100):
             (directory / f"file-{j}").touch()
+    # A writer can lose the race against deletion even while it keeps running.
+    # Protect a nonempty directory to guarantee failure independently of scheduling.
+    protected = tree / "protected"
+    if persistent:
+        protected.mkdir()
+        (protected / "sentinel").touch()
+        protected.chmod(0o555)
     ready = env.tmp_path / "writer-ready"
     stop = env.tmp_path / "writer-stop"
     writer = subprocess.Popen(
@@ -1702,10 +1709,10 @@ while not stop.exists() and time.monotonic() < deadline:
             assert trash.is_dir()
             assert trash.stat().st_ino == record["inode"]
             assert trash.stat().st_dev == record["device"]
-            assert "Directory not empty" in log.read_text()
+            assert "Permission denied" in log.read_text()
             assert "Recursive deletion encountered" in log.read_text()
             assert not list(trash.rglob("crate-*")), (
-                "Busy directory must not block sibling cleanup"
+                "Failed directories must not block sibling cleanup"
             )
             assert "post-failure snapshot" in log.read_text()
         else:
@@ -1719,3 +1726,8 @@ while not stop.exists() and time.monotonic() < deadline:
         stop.touch()
         writer.terminate()
         writer.wait(timeout=5)
+        if persistent:
+            for parent in [tree, *tree.parent.glob(f".workmux_trash_{branch}_*")]:
+                remaining = parent / "protected"
+                if remaining.exists():
+                    remaining.chmod(0o755)
