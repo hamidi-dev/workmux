@@ -24,7 +24,7 @@ editUrl: https://github.com/raine/workmux/edit/main/CHANGELOG.md
 ## v0.1.259 (2026-09-08)
 
 - Show how many agents remain below the visible area in the sidebar's tile view.
-- Fix worktree cleanup giving up when background processes keep writing files: continue removing unrelated files, retry temporary failures, and retain recovery details if cleanup still fails.
+- Fix worktree cleanup giving up when background processes keep writing files. You may find files left behind by previous removals in hidden `.workmux_trash_*` directories alongside your worktrees.
 
 ## v0.1.258 (2026-09-07)
 
