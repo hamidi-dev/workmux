@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 import pytest
 import yaml
 
+from .support.executable import SCRIPT_RUNNER, install_script
+
 
 # =============================================================================
 # Shell Testing Configuration
@@ -199,8 +201,11 @@ class MuxEnvironment(ABC):
             '  echo "Test commit" > "$1"\n'
             "fi\n"
         )
-        fake_editor_script.chmod(0o755)
-        self.env["GIT_EDITOR"] = str(fake_editor_script)
+        self.env["GIT_EDITOR"] = f"/bin/sh {shlex.quote(str(fake_editor_script))}"
+
+    def install_script(self, path: Path, body: str) -> Path:
+        """Install a PATH-discoverable test double with a shared entry point."""
+        return install_script(path, body)
 
     @property
     @abstractmethod
@@ -998,10 +1003,13 @@ class FakeAgentInstaller:
 
     def install(self, name: str, script_body: str) -> Path:
         """Creates a fake agent command; the bin dir is already on PATH."""
-        script_path = self.bin_dir / name
-        script_path.write_text(script_body)
-        script_path.chmod(0o755)
-        return script_path
+        return self.env.install_script(self.bin_dir / name, script_body)
+
+
+@pytest.fixture(scope="session")
+def script_runner() -> Path:
+    """All test doubles share the repository runner's executable inode."""
+    return SCRIPT_RUNNER
 
 
 @pytest.fixture
@@ -1511,7 +1519,6 @@ def make_env_script(env: MuxEnvironment, command: str, env_vars: dict[str, str])
 {command}
 """
     script_file.write_text(script_content)
-    script_file.chmod(0o755)
     # Invoke the interpreter directly: cold shebang execution on macOS can
     # stall before the script body starts, consuming the command's wait budget.
     return f"/bin/sh {shlex.quote(str(script_file))}"
@@ -1599,7 +1606,6 @@ export WORKMUX_TEST=1
 {pipe_cmd}{shlex.quote(str(workmux_exe_path))} {command} > {shlex.quote(str(stdout_file))} 2> {shlex.quote(str(stderr_file))}
 """
     script_file.write_text(script_content)
-    script_file.chmod(0o755)
 
     # Read the script through its interpreter, avoiding cold shebang startup
     # delays before the command can execute (as in make_env_script).
@@ -1972,14 +1978,14 @@ def run_workmux_merge(
     # Create a simple editor script for non-interactive git commits
     editor_script = scripts_dir / "git_editor.sh"
     editor_script.write_text('#!/bin/sh\necho "Auto commit from test" > "$1"\n')
-    editor_script.chmod(0o755)
+    editor_command = f"/bin/sh {shlex.quote(str(editor_script))}"
 
     started_command = (
         f"echo started > {shlex.quote(str(started_file))}; " if started_file else ""
     )
     merge_script = (
         f"{started_command}"
-        f"export GIT_EDITOR={shlex.quote(str(editor_script))} && "
+        f"export GIT_EDITOR={shlex.quote(editor_command)} && "
         f"cd {shlex.quote(str(workdir))} && "
         f"{shlex.quote(str(workmux_exe_path))} merge {flags_str} {branch_arg} "
         f"> {shlex.quote(str(stdout_file))} 2> {shlex.quote(str(stderr_file))}; "
@@ -2065,8 +2071,7 @@ echo "gh: command not implemented in fake" >&2
 exit 1
 """
 
-    gh_script.write_text(script_content)
-    gh_script.chmod(0o755)
+    env.install_script(gh_script, script_content)
 
     # Add the bin directory to PATH
     new_path = f"{bin_dir}:{env.env.get('PATH', '')}"

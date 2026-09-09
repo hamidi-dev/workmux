@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from .conftest import (
+    FakeAgentInstaller,
     TmuxEnvironment,
     WorkmuxCommandResult,
     assert_session_exists,
@@ -112,12 +113,11 @@ echo "$status" > {shlex.quote(str(exit_code_file))}
 exit "$status"
 """
     script_file.write_text(script_content)
-    script_file.chmod(0o755)
 
     # Ignore the pane hangup so deferred session removal cannot interrupt capture.
     env.send_keys(
         f"={session_name}:",
-        f"nohup {shlex.quote(str(script_file))} >/dev/null 2>&1 &",
+        f"nohup /bin/sh {shlex.quote(str(script_file))} >/dev/null 2>&1 &",
     )
 
     # Wait for completion (longer timeout to account for deferred scripts)
@@ -288,7 +288,11 @@ class TestCreateAndSwitch:
 
 class TestStableSessionCleanupIdentity:
     def test_session_rename_does_not_release_deferred_cleanup(
-        self, mux_server: TmuxEnvironment, workmux_exe_path: Path, repo_path: Path
+        self,
+        mux_server: TmuxEnvironment,
+        workmux_exe_path: Path,
+        repo_path: Path,
+        fake_agent_installer: FakeAgentInstaller,
     ):
         env = mux_server
         branch_name = "stable-session-id"
@@ -309,15 +313,14 @@ class TestStableSessionCleanupIdentity:
 
         real_tmux = shutil.which("tmux")
         assert real_tmux is not None
-        fake_tmux = env.fake_bin_dir / "tmux"
-        fake_tmux.write_text(
+        fake_tmux = fake_agent_installer.install(
+            "tmux",
             "#!/bin/sh\n"
             'for arg in "$@"; do\n'
             '  if [ "$arg" = kill-session ]; then exit 0; fi\n'
             "done\n"
-            f'exec {shlex.quote(real_tmux)} "$@"\n'
+            f'exec {shlex.quote(real_tmux)} "$@"\n',
         )
-        fake_tmux.chmod(0o755)
 
         scripts_dir = get_scripts_dir(env)
         output = scripts_dir / "stable-session-output"
@@ -331,8 +334,7 @@ class TestStableSessionCleanupIdentity:
             f"exec {shlex.quote(str(workmux_exe_path))} remove --force "
             f">{shlex.quote(str(output))} 2>&1\n"
         )
-        script.chmod(0o755)
-        env.send_keys(f"={session_name}:", str(script))
+        env.send_keys(f"={session_name}:", f"/bin/sh {shlex.quote(str(script))}")
         assert poll_until(
             lambda: output.exists() and "Scheduled removal" in output.read_text()
         )

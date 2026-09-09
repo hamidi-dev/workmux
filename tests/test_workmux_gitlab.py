@@ -98,7 +98,8 @@ def install_fake_glab(
         }
         for args, response, exit_code in calls
     ]
-    script_path.write_text(
+    env.install_script(
+        script_path,
         f"""#!{sys.executable}
 import json
 import pathlib
@@ -136,9 +137,8 @@ if specification["stdout"]:
 if specification["stderr"]:
     print(specification["stderr"], file=sys.stderr)
 raise SystemExit(specification["exit_code"])
-"""
+""",
     )
-    script_path.chmod(0o755)
     return log_path
 
 

@@ -263,11 +263,11 @@ def test_set_window_status_without_tmux_env_uses_process_ancestry(
     real_tmux = shutil.which("tmux", path=os.environ.get("PATH", ""))
     assert real_tmux is not None, "tmux binary not found"
     tmux_wrapper = env.fake_bin_dir / "tmux"
-    tmux_wrapper.write_text(
+    env.install_script(
+        tmux_wrapper,
         "#!/bin/sh\n"
-        f'exec {shlex.quote(real_tmux)} -S {shlex.quote(str(env.socket_path))} "$@"\n'
+        f'exec {shlex.quote(real_tmux)} -S {shlex.quote(str(env.socket_path))} "$@"\n',
     )
-    tmux_wrapper.chmod(0o755)
 
     marker_path = env.tmp_path / "status-no-tmux-env-finished"
     release_fifo = env.tmp_path / "status-no-tmux-env-release"
@@ -338,11 +338,11 @@ def test_set_window_status_without_pane_identity_refuses_cwd_match(
     real_tmux = shutil.which("tmux", path=os.environ.get("PATH", ""))
     assert real_tmux is not None, "tmux binary not found"
     tmux_wrapper = env.fake_bin_dir / "tmux"
-    tmux_wrapper.write_text(
+    env.install_script(
+        tmux_wrapper,
         "#!/bin/sh\n"
-        f'exec {shlex.quote(real_tmux)} -S {shlex.quote(str(env.socket_path))} "$@"\n'
+        f'exec {shlex.quote(real_tmux)} -S {shlex.quote(str(env.socket_path))} "$@"\n',
     )
-    tmux_wrapper.chmod(0o755)
 
     worktree_path = get_worktree_path(mux_repo_path, branch_name)
     host_env = env.env.copy()
@@ -651,15 +651,15 @@ def test_status_update_preserves_state_when_tmux_boot_id_is_unavailable(
     wrapper_dir = env.tmp_path / "boot-id-failure-bin"
     wrapper_dir.mkdir()
     tmux_wrapper = wrapper_dir / "tmux"
-    tmux_wrapper.write_text(
+    env.install_script(
+        tmux_wrapper,
         "#!/bin/sh\n"
         'if [ "$1" = display-message ] && [ "$2" = -p ] '
         "&& [ \"$3\" = '#{start_time}:#{pid}' ]; then\n"
         "  exit 1\n"
         "fi\n"
-        f'exec {shlex.quote(real_tmux)} "$@"\n'
+        f'exec {shlex.quote(real_tmux)} "$@"\n',
     )
-    tmux_wrapper.chmod(0o755)
 
     marker = env.tmp_path / "boot-id-failure-status-finished"
     env.send_keys(
@@ -704,7 +704,8 @@ def test_status_update_preserves_state_when_tmux_pane_pid_is_unavailable(
     wrapper_dir = env.tmp_path / "pane-pid-failure-bin"
     wrapper_dir.mkdir()
     tmux_wrapper = wrapper_dir / "tmux"
-    tmux_wrapper.write_text(
+    env.install_script(
+        tmux_wrapper,
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "if [[ ${1:-} == display-message && ${2:-} == -t "
@@ -712,9 +713,8 @@ def test_status_update_preserves_state_when_tmux_pane_pid_is_unavailable(
         "  format=${5//'#{pane_pid}'/not-a-pid}\n"
         f'  exec {shlex.quote(real_tmux)} "$1" "$2" "$3" "$4" "$format"\n'
         "fi\n"
-        f'exec {shlex.quote(real_tmux)} "$@"\n'
+        f'exec {shlex.quote(real_tmux)} "$@"\n',
     )
-    tmux_wrapper.chmod(0o755)
 
     marker = env.tmp_path / "pane-pid-failure-status-finished"
     env.send_keys(

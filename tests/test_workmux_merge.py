@@ -164,14 +164,14 @@ def test_merge_reports_close_scheduling_failure_after_success(
     real_tmux = shutil.which("tmux")
     assert real_tmux is not None
     fake_tmux = env.fake_bin_dir / "tmux"
-    fake_tmux.write_text(
+    env.install_script(
+        fake_tmux,
         "#!/bin/sh\n"
         'for arg in "$@"; do\n'
         '  if [ "$arg" = run-shell ]; then exit 42; fi\n'
         "done\n"
-        f'exec {shlex.quote(real_tmux)} "$@"\n'
+        f'exec {shlex.quote(real_tmux)} "$@"\n',
     )
-    fake_tmux.chmod(0o755)
 
     run_workmux_merge(
         env,

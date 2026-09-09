@@ -84,7 +84,8 @@ def install_fake_gh_pr_list_retry(env: MuxEnvironment, branch_name: str) -> None
             }
         ]
     )
-    gh_path.write_text(
+    env.install_script(
+        gh_path,
         f"""#!/usr/bin/env python3
 import sys
 
@@ -97,9 +98,8 @@ if sys.argv[1:3] == ["pr", "list"]:
 
 print("unexpected gh command: " + " ".join(sys.argv[1:]), file=sys.stderr)
 sys.exit(1)
-"""
+""",
     )
-    gh_path.chmod(0o755)
 
 
 def write_agent_state_file(env: MuxEnvironment, worktree_path: Path, status: str):

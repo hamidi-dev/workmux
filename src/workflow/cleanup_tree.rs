@@ -115,6 +115,8 @@ fn unlink_directory(parent: &File, name: &OsStr, directory: &File) -> io::Result
             "Directory identity changed before removal",
         ));
     }
+    #[cfg(test)]
+    before_rmdir::fire(name);
     unlinkat(parent, name, UnlinkatFlags::RemoveDir).map_err(Into::into)
 }
 
@@ -164,6 +166,39 @@ impl Failures {
                 self.count, self.details, truncated
             ),
         ))
+    }
+}
+
+/// Coordinate late file creation after enumeration and before the real rmdir.
+/// Thread-local guards keep parallel tests isolated and restore hooks on panic.
+#[cfg(test)]
+pub(super) mod before_rmdir {
+    use std::cell::RefCell;
+    use std::ffi::OsStr;
+
+    type Hook = Box<dyn FnMut(&OsStr)>;
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub struct Guard(Option<Hook>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub fn install(hook: impl FnMut(&OsStr) + 'static) -> Guard {
+        Guard(HOOK.with(|slot| slot.replace(Some(Box::new(hook)))))
+    }
+
+    pub(super) fn fire(name: &OsStr) {
+        HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(name);
+            }
+        });
     }
 }
 

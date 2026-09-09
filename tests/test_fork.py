@@ -234,7 +234,7 @@ def create_fake_codex_session(
     return rollout_path
 
 
-def write_codex_shim(bin_dir: Path) -> tuple[Path, Path]:
+def write_codex_shim(env: MuxEnvironment, bin_dir: Path) -> tuple[Path, Path]:
     """Create a `codex` stand-in that records the arguments it was launched with.
 
     Returns the shim path and the file it writes its arguments to.
@@ -242,8 +242,7 @@ def write_codex_shim(bin_dir: Path) -> tuple[Path, Path]:
     bin_dir.mkdir(parents=True, exist_ok=True)
     argv_file = bin_dir / "codex-argv.txt"
     shim = bin_dir / "codex"
-    shim.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {argv_file}\n')
-    shim.chmod(0o755)
+    env.install_script(shim, f'#!/bin/sh\nprintf "%s\\n" "$@" > {argv_file}\n')
     return shim, argv_file
 
 
@@ -264,7 +263,7 @@ class TestForkCodex:
         """--fork should launch `codex fork` pinned to the new worktree."""
         env = mux_server
         codex_home = tmp_path / "codex"
-        shim, argv_file = write_codex_shim(tmp_path / "bin")
+        shim, argv_file = write_codex_shim(mux_server, tmp_path / "bin")
         write_workmux_config(
             mux_repo_path, panes=[{"command": "<agent>"}], agent=str(shim)
         )
@@ -300,7 +299,7 @@ class TestForkCodex:
         """--fork=<prefix> should select the matching Codex session."""
         env = mux_server
         codex_home = tmp_path / "codex"
-        shim, argv_file = write_codex_shim(tmp_path / "bin")
+        shim, argv_file = write_codex_shim(mux_server, tmp_path / "bin")
         write_workmux_config(
             mux_repo_path, panes=[{"command": "<agent>"}], agent=str(shim)
         )

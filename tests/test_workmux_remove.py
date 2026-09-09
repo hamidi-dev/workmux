@@ -1,7 +1,6 @@
 import json
+import os
 import shlex
-import subprocess
-import sys
 import shutil
 import uuid
 from pathlib import Path
@@ -1151,6 +1150,12 @@ def test_deferred_remove_cleans_up_after_final_tmux_window_closes(
         timeout=10.0,
     )
     assert env.tmux(["has-session"], check=False).returncode != 0
+    pending = Path(env.env["XDG_STATE_HOME"]) / "workmux" / "pending-cleanup"
+    assert poll_until(
+        lambda: not list(worktree_path.parent.glob(f".workmux_trash_{branch_name}_*"))
+        and not list(pending.glob("*.json")),
+        timeout=10.0,
+    )
 
 
 @pytest.mark.tmux_only
@@ -1299,14 +1304,14 @@ def test_deferred_worker_timeout_is_scheduled_and_durably_logged(
     write_workmux_config(mux_repo_path)
     run_workmux_add(env, workmux_exe_path, mux_repo_path, branch_name)
     fake_tmux = env.fake_bin_dir / "tmux"
-    fake_tmux.write_text(
+    env.install_script(
+        fake_tmux,
         "#!/bin/sh\n"
         'for arg in "$@"; do\n'
         '  case "$arg" in kill-window|kill-session) exit 0;; esac\n'
         "done\n"
-        f'exec {shlex.quote(real_tmux)} "$@"\n'
+        f'exec {shlex.quote(real_tmux)} "$@"\n',
     )
-    fake_tmux.chmod(0o755)
     command = (
         f"cd {shlex.quote(str(worktree_path))} && "
         f"{shlex.quote(str(workmux_exe_path))} remove --force {branch_name} "
@@ -1615,75 +1620,28 @@ def test_deferred_worktree_lock_removal_failure_is_durably_logged(
 
 
 @pytest.mark.tmux_only
-@pytest.mark.parametrize(
-    "persistent", [False, True], ids=["writer-stops", "writer-persists"]
-)
-def test_deferred_cleanup_with_surviving_writer(
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_deferred_cleanup_retains_record_when_quarantine_deletion_fails(
     mux_server: TmuxEnvironment,
     workmux_exe_path: Path,
     mux_repo_path: Path,
-    persistent: bool,
 ):
-    """Detached writes allow cleanup; permanent failures retain an identity record."""
+    """A detached worker durably records a partially deleted quarantine."""
     env = mux_server
-    branch = "cleanup-writer"
+    branch = "cleanup-orphan"
     write_workmux_config(mux_repo_path)
     run_workmux_add(env, workmux_exe_path, mux_repo_path, branch)
     tree = get_worktree_path(mux_repo_path, branch)
     build = tree / "target" / "debug" / "build"
-    build.mkdir(parents=True)
-    for i in range(100):
-        directory = build / f"crate-{i}"
-        directory.mkdir()
-        for j in range(100):
-            (directory / f"file-{j}").touch()
-    # A writer can lose the race against deletion even while it keeps running.
-    # Protect a nonempty directory to guarantee failure independently of scheduling.
-    protected = tree / "protected"
-    if persistent:
-        protected.mkdir()
-        (protected / "sentinel").touch()
-        protected.chmod(0o555)
-    ready = env.tmp_path / "writer-ready"
-    stop = env.tmp_path / "writer-stop"
-    writer = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            """
-import pathlib, sys, time
-ready, stop, original = map(pathlib.Path, sys.argv[1:4])
-ready.touch()
-renamed_at = None
-deadline = time.monotonic() + 30
-while not stop.exists() and time.monotonic() < deadline:
-    if not original.exists() and renamed_at is None:
-        renamed_at = time.monotonic()
-    if sys.argv[4] == 'False' and renamed_at is not None:
-        if time.monotonic() - renamed_at > 1:
-            break
+    sibling = build / "crate-0"
+    sibling.mkdir(parents=True)
+    (sibling / "artifact").touch()
+    protected = build / "protected"
+    protected.mkdir()
+    (protected / "artifact").touch()
+    protected.chmod(0o555)
     try:
-        directory = pathlib.Path('target/debug/build/churn')
-        directory.mkdir(parents=True, exist_ok=True)
-        for i in range(200):
-            (directory / f'file-{i}').touch()
-    except OSError:
-        pass
-""",
-            str(ready),
-            str(stop),
-            str(tree),
-            str(persistent),
-        ],
-        cwd=tree,
-        env=env.env,
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        assert poll_until(ready.exists)
-        output = env.tmp_path / "cleanup-writer-output"
+        output = env.tmp_path / "cleanup-orphan-output"
         command = (
             f"cd {shlex.quote(str(tree))} && "
             f"{shlex.quote(str(workmux_exe_path))} remove --force {branch} "
@@ -1692,42 +1650,37 @@ while not stop.exists() and time.monotonic() < deadline:
         env.send_keys(get_window_name(branch), command)
         assert poll_until(
             lambda: output.exists() and "Scheduled removal" in output.read_text()
-        )
+        ), env.capture_pane(get_window_name(branch))
         state = Path(env.env["XDG_STATE_HOME"]) / "workmux"
         pending = state / "pending-cleanup"
         log = state / "workmux.log"
-        if persistent:
-            assert poll_until(
-                lambda: log.exists()
-                and "pending cleanup record retained at" in log.read_text(),
-                timeout=15,
-            )
-            records = list(pending.glob("*.json"))
-            assert len(records) == 1
-            record = json.loads(records[0].read_text())
-            trash = Path(record["quarantine_path"])
-            assert trash.is_dir()
-            assert trash.stat().st_ino == record["inode"]
-            assert trash.stat().st_dev == record["device"]
-            assert "Permission denied" in log.read_text()
-            assert "Recursive deletion encountered" in log.read_text()
-            assert not list(trash.rglob("crate-*")), (
-                "Failed directories must not block sibling cleanup"
-            )
-            assert "post-failure snapshot" in log.read_text()
-        else:
-            assert poll_until(
-                lambda: not tree.exists()
-                and not list(tree.parent.glob(f".workmux_trash_{branch}_*"))
-                and not list(pending.glob("*.json")),
-                timeout=15,
-            )
+        assert poll_until(
+            lambda: log.exists()
+            and "pending cleanup record retained at" in log.read_text(),
+            timeout=15,
+        )
+        assert get_window_name(branch) not in env.list_windows()
+        assert not tree.exists()
+        records = list(pending.glob("*.json"))
+        assert len(records) == 1
+        record = json.loads(records[0].read_text())
+        trash = Path(record["quarantine_path"])
+        assert record["original_path"] == str(tree)
+        assert trash.is_dir()
+        assert trash.stat().st_ino == record["inode"]
+        assert trash.stat().st_dev == record["device"]
+        assert "kind=PermissionDenied" in log.read_text()
+        assert "Permission denied" in log.read_text()
+        assert "Recursive deletion encountered" in log.read_text()
+        assert "post-failure snapshot" in log.read_text()
+        assert not list(trash.rglob("crate-*")), (
+            "An undeletable directory must not block sibling cleanup"
+        )
+        assert (trash / "target/debug/build/protected/artifact").is_file()
     finally:
-        stop.touch()
-        writer.terminate()
-        writer.wait(timeout=5)
-        if persistent:
-            for parent in [tree, *tree.parent.glob(f".workmux_trash_{branch}_*")]:
-                remaining = parent / "protected"
-                if remaining.exists():
-                    remaining.chmod(0o755)
+        # The worker may have renamed the tree even if an assertion failed.
+        candidates = [tree, *tree.parent.glob(f".workmux_trash_{branch}_*")]
+        for candidate in candidates:
+            directory = candidate / "target/debug/build/protected"
+            if directory.exists():
+                directory.chmod(0o755)

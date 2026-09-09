@@ -1,6 +1,10 @@
 """Regression tests for command execution and identity in the test harness."""
 
 from pathlib import Path
+import os
+import signal
+import subprocess
+import sys
 
 import pytest
 
@@ -112,3 +116,74 @@ def test_workmux_command_reads_script_through_interpreter(
     ]
     assert result.stderr == "error"
     assert "HARNESS_VALUE" not in env.env
+
+
+@pytest.mark.parametrize(
+    "interpreter", ["/bin/sh", "/usr/bin/env bash", sys.executable]
+)
+@pytest.mark.parametrize("absolute", [False, True], ids=["PATH", "absolute"])
+@pytest.mark.parametrize("exit_code", [0, 17])
+def test_shared_script_preserves_process_contract(
+    tmp_path: Path, interpreter: str, exit_code: int, absolute: bool
+):
+    """A PATH-resolved test double execs its interpreter without a helper child."""
+    from .support.executable import install_script
+
+    bin_dir = tmp_path / "bin with 'quotes'"
+    bin_dir.mkdir()
+    if interpreter == sys.executable:
+        body = (
+            "import os, sys\n"
+            "line = sys.stdin.readline().rstrip('\\n')\n"
+            "print(os.getpid(), line, sys.argv[1], os.environ['VALUE'], os.getcwd(), sep='\\n')\n"
+            "print('error', end='', file=sys.stderr)\n"
+            f"sys.exit({exit_code})\n"
+        )
+    else:
+        body = (
+            "read -r input\n"
+            'printf "%s\\n" "$$" "$input" "$1" "$VALUE" "$PWD"\n'
+            "printf error >&2\n"
+            f"exit {exit_code}\n"
+        )
+    command = install_script(bin_dir / "agent", f"#!{interpreter}\n{body}")
+    payload = command.with_name(command.name + ".script")
+    assert not os.access(payload, os.X_OK)
+    shadow = tmp_path / "non-executable-first"
+    shadow.mkdir()
+    (shadow / "agent").touch()
+    env = {
+        **os.environ,
+        "PATH": f"{shadow}:{bin_dir}:{os.environ['PATH']}",
+        "VALUE": "$literal",
+    }
+    child = subprocess.Popen(
+        [str(command) if absolute else command.name, "spaces, 'quotes', and λ"],
+        cwd=tmp_path,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = child.communicate("input\n", timeout=5)
+    assert child.returncode == exit_code
+    assert stdout.splitlines() == [
+        str(child.pid),
+        "input",
+        "spaces, 'quotes', and λ",
+        "$literal",
+        str(tmp_path.resolve()),
+    ]
+    assert stderr == "error"
+
+
+def test_shared_script_reinstallation_and_signals(tmp_path: Path, script_runner: Path):
+    from .support.executable import install_script
+
+    command = install_script(tmp_path / "agent", "#!/bin/sh\nexit 17\n")
+    assert subprocess.run([str(command)]).returncode == 17
+    original_binary = script_runner.read_bytes()
+    install_script(command, '#!/bin/sh\nkill -TERM "$$"\n')
+    assert subprocess.run([str(command)]).returncode == -signal.SIGTERM
+    assert script_runner.read_bytes() == original_binary
