@@ -98,6 +98,10 @@ pub struct DashboardConfig {
     /// Default: number, project, worktree, git, pr, status, time, title.
     pub agent_columns: Option<Vec<AgentColumn>>,
 
+    /// Columns of the worktree table, in display order. Omit a column to hide it.
+    /// Default: number, project, worktree, git, pr, mux, age, agent.
+    pub worktree_columns: Option<Vec<WorktreeColumn>>,
+
     /// Default sort mode for the agent list: "priority", "project", "recency", "natural".
     /// Used when the dashboard has no persisted sort preference.
     /// Default: "priority"
@@ -144,6 +148,46 @@ pub const DEFAULT_AGENT_COLUMNS: [AgentColumn; 8] = [
     AgentColumn::Title,
 ];
 
+/// A configurable column of the dashboard worktree table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeColumn {
+    Number,
+    Project,
+    Worktree,
+    Git,
+    Pr,
+    Mux,
+    Age,
+    Agent,
+}
+
+/// Columns used when the config does not set `dashboard.worktree_columns`.
+pub const DEFAULT_WORKTREE_COLUMNS: [WorktreeColumn; 8] = [
+    WorktreeColumn::Number,
+    WorktreeColumn::Project,
+    WorktreeColumn::Worktree,
+    WorktreeColumn::Git,
+    WorktreeColumn::Pr,
+    WorktreeColumn::Mux,
+    WorktreeColumn::Age,
+    WorktreeColumn::Agent,
+];
+
+fn columns_or_default<T: Copy + PartialEq>(configured: Option<&[T]>, defaults: &[T]) -> Vec<T> {
+    let mut columns = Vec::new();
+    for column in configured.unwrap_or(defaults) {
+        if !columns.contains(column) {
+            columns.push(*column);
+        }
+    }
+    if columns.is_empty() {
+        defaults.to_vec()
+    } else {
+        columns
+    }
+}
+
 impl DashboardConfig {
     pub fn commit(&self) -> &str {
         self.commit
@@ -165,22 +209,14 @@ impl DashboardConfig {
     /// a column is never rendered twice, and an empty or absent list falls back
     /// to the default order.
     pub fn agent_columns(&self) -> Vec<AgentColumn> {
-        let Some(configured) = self.agent_columns.as_ref() else {
-            return DEFAULT_AGENT_COLUMNS.to_vec();
-        };
+        columns_or_default(self.agent_columns.as_deref(), &DEFAULT_AGENT_COLUMNS)
+    }
 
-        let mut seen = Vec::new();
-        for column in configured {
-            if !seen.contains(column) {
-                seen.push(*column);
-            }
-        }
-
-        if seen.is_empty() {
-            DEFAULT_AGENT_COLUMNS.to_vec()
-        } else {
-            seen
-        }
+    /// Columns of the worktree table, in display order. Duplicates are dropped so
+    /// a column is never rendered twice, and an empty or absent list falls back
+    /// to the default order.
+    pub fn worktree_columns(&self) -> Vec<WorktreeColumn> {
+        columns_or_default(self.worktree_columns.as_deref(), &DEFAULT_WORKTREE_COLUMNS)
     }
 
     /// Whether to show check pass/total counts alongside check icons.
@@ -2756,8 +2792,11 @@ impl Config {
             agent_columns: project
                 .dashboard
                 .agent_columns
-                .clone()
-                .or_else(|| self.dashboard.agent_columns.clone()),
+                .or(self.dashboard.agent_columns),
+            worktree_columns: project
+                .dashboard
+                .worktree_columns
+                .or(self.dashboard.worktree_columns),
             sort_mode: project.dashboard.sort_mode.or(self.dashboard.sort_mode),
             close_on_jump: project
                 .dashboard
@@ -3247,6 +3286,7 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 # Preview size (10-90): larger = more preview, less table. Use +/- keys to adjust.
 # Columns of the agents table, in display order. Omit a column to hide it:
 # number, project, worktree, git, pr, status, time, title.
+# Worktree columns: number, project, worktree, git, pr, mux, age, agent.
 # Default sort mode for the agent list: priority (default), project, recency, natural.
 # Used only when no sort preference has been persisted in the dashboard.
 # dashboard:
@@ -3254,6 +3294,7 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   merge: "!workmux merge"
 #   preview_size: 60
 #   agent_columns: [number, project, worktree, git, pr, status, time, title]
+#   worktree_columns: [number, project, worktree, git, pr, mux, age, agent]
 #   sort_mode: priority
 #   close_on_jump: true
 
@@ -3426,10 +3467,11 @@ mod tests {
     use super::{
         AgentColumn, AgentEnvValue, AgentIconConfig, AgentIconDetails, AllowedDomainDetails,
         AllowedDomainEntry, Config, ContainerConfig, ContainerDevice, DEFAULT_AGENT_COLUMNS,
-        ExtraMount, FileConfig, LayoutConfig, LimaConfig, NetworkConfig, NetworkPolicy, PaneConfig,
-        SandboxConfig, SandboxRuntime, SandboxTarget, SidebarHeight, SidebarPosition, SidebarWidth,
-        SplitDirection, ToolchainMode, WindowPlacement, is_agent_command, validate_domain,
-        validate_group_add_entry, validate_layouts_config,
+        DEFAULT_WORKTREE_COLUMNS, ExtraMount, FileConfig, LayoutConfig, LimaConfig, NetworkConfig,
+        NetworkPolicy, PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget, SidebarHeight,
+        SidebarPosition, SidebarWidth, SplitDirection, ToolchainMode, WindowPlacement,
+        WorktreeColumn, is_agent_command, validate_domain, validate_group_add_entry,
+        validate_layouts_config,
     };
     use crate::test_support;
     use tempfile::TempDir;
@@ -3539,6 +3581,108 @@ mod tests {
         assert_eq!(
             global.merge(Config::default()).dashboard.agent_columns(),
             vec![AgentColumn::Status, AgentColumn::Title]
+        );
+    }
+
+    #[test]
+    fn worktree_columns_default_when_unset() {
+        let config = Config::default();
+        assert_eq!(
+            config.dashboard.worktree_columns(),
+            vec![
+                WorktreeColumn::Number,
+                WorktreeColumn::Project,
+                WorktreeColumn::Worktree,
+                WorktreeColumn::Git,
+                WorktreeColumn::Pr,
+                WorktreeColumn::Mux,
+                WorktreeColumn::Age,
+                WorktreeColumn::Agent
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_columns_follow_configured_order() {
+        let config: Config = serde_yaml::from_str(
+            "dashboard:\n  worktree_columns: [agent, mux, number, worktree, git, pr, project, age]\n",
+        )
+        .expect("config parses");
+        assert_eq!(
+            config.dashboard.worktree_columns(),
+            vec![
+                WorktreeColumn::Agent,
+                WorktreeColumn::Mux,
+                WorktreeColumn::Number,
+                WorktreeColumn::Worktree,
+                WorktreeColumn::Git,
+                WorktreeColumn::Pr,
+                WorktreeColumn::Project,
+                WorktreeColumn::Age
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_columns_drop_duplicates_and_allow_omitting() {
+        let config: Config =
+            serde_yaml::from_str("dashboard:\n  worktree_columns: [agent, agent, mux]\n")
+                .expect("config parses");
+        assert_eq!(
+            config.dashboard.worktree_columns(),
+            vec![WorktreeColumn::Agent, WorktreeColumn::Mux]
+        );
+    }
+
+    #[test]
+    fn worktree_columns_empty_list_falls_back_to_default() {
+        let config: Config =
+            serde_yaml::from_str("dashboard:\n  worktree_columns: []\n").expect("config parses");
+        assert_eq!(
+            config.dashboard.worktree_columns(),
+            DEFAULT_WORKTREE_COLUMNS
+        );
+    }
+
+    #[test]
+    fn worktree_columns_project_overrides_global() {
+        let global: Config = serde_yaml::from_str("dashboard:\n  worktree_columns: [mux, agent]\n")
+            .expect("config parses");
+        let project: Config =
+            serde_yaml::from_str("dashboard:\n  worktree_columns: [agent, mux]\n")
+                .expect("config parses");
+        assert_eq!(
+            global.merge(project).dashboard.worktree_columns(),
+            vec![WorktreeColumn::Agent, WorktreeColumn::Mux]
+        );
+    }
+
+    #[test]
+    fn worktree_columns_inherit_global_when_project_unset() {
+        let global: Config = serde_yaml::from_str("dashboard:\n  worktree_columns: [mux, agent]\n")
+            .expect("config parses");
+        assert_eq!(
+            global.merge(Config::default()).dashboard.worktree_columns(),
+            vec![WorktreeColumn::Mux, WorktreeColumn::Agent]
+        );
+    }
+
+    #[test]
+    fn worktree_columns_reject_unknown_names() {
+        let error = serde_yaml::from_str::<Config>("dashboard:\n  worktree_columns: [title]\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown variant `title`"));
+    }
+
+    #[test]
+    fn worktree_columns_empty_project_list_resets_global_to_defaults() {
+        let global: Config = serde_yaml::from_str("dashboard:\n  worktree_columns: [agent]\n")
+            .expect("global config parses");
+        let project: Config = serde_yaml::from_str("dashboard:\n  worktree_columns: []\n")
+            .expect("project config parses");
+        assert_eq!(
+            global.merge(project).dashboard.worktree_columns(),
+            DEFAULT_WORKTREE_COLUMNS
         );
     }
 
