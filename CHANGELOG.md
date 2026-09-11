@@ -21,6 +21,12 @@ editUrl: https://github.com/raine/workmux/edit/main/CHANGELOG.md
 <!-- skipped: v0.1.25 -->
 <!-- skipped: v0.1.8 -->
 
+## v0.1.260 (2026-09-11)
+
+- Create worktrees without a terminal multiplexer using `workmux add --headless`, with file operations and setup hooks included. Add `--json` for automation, and attach later with `workmux open`.
+- Hide or reorder columns in the dashboard's Worktrees tab with `dashboard.worktree_columns`. ([#270](https://github.com/raine/workmux/issues/270))
+- Keep Pi agents marked as working while delegated children are active, even after the parent finishes its turn. See https://github.com/raine/pi-suba for more.
+
 ## v0.1.259 (2026-09-08)
 
 - Show how many agents remain below the visible area in the sidebar's tile view.
