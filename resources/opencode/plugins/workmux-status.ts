@@ -112,6 +112,10 @@ export const WorkmuxStatusPlugin: Plugin = async ({ $, client }) => {
       status = 'working';
     }
 
+    // Discovering a fresh conversation is not a completion. Once activity was
+    // reported, a root change still updates the session bound to this pane.
+    if (status === 'done' && reportedStatus === undefined) return;
+
     if (reportedStatus === status && reportedSession === rootSession && !(status === 'working' && pendingPrompt !== undefined)) {
       return;
     }

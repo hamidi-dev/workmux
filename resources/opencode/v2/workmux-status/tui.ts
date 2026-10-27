@@ -24,13 +24,15 @@ function isMissingSession(error: unknown, sessionID: string): boolean {
     && 'sessionID' in error && error.sessionID === sessionID;
 }
 
-function workmux(args: string[], prompt?: string): Promise<boolean> {
+function workmux(args: string[], prompt?: string, sessionID?: string): Promise<boolean> {
   return new Promise((resolve) => {
-    // Workmux reads hook metadata until EOF; close stdin after sending a prompt.
-    const child = spawn('workmux', args, { stdio: [prompt === undefined ? 'ignore' : 'pipe', 'ignore', 'ignore'], timeout: 3000 });
+    // Carry identity and prompt in one hook payload. --session-id intentionally
+    // skips stdin, so combining that flag with prompt input would lose the prompt.
+    const hasPayload = prompt !== undefined || sessionID !== undefined;
+    const child = spawn('workmux', args, { stdio: [hasPayload ? 'pipe' : 'ignore', 'ignore', 'ignore'], timeout: 3000 });
     if (child.stdin) {
       child.stdin.on('error', () => {});
-      child.stdin.end(JSON.stringify({ prompt }));
+      child.stdin.end(JSON.stringify({ prompt, session_id: sessionID }) + '\n');
     }
     let spawnError: string | undefined;
     child.on('error', (error: NodeJS.ErrnoException) => {
@@ -53,6 +55,7 @@ export default Plugin.define({
     let closed = false;
     let desired: WindowStatus | undefined;
     let reported: WindowStatus | undefined;
+    let reportedSession: string | undefined;
     let queue = workmux(['register-agent']).then(() => {});
     let pendingPrompt: { text: string; sessionID: string } | undefined;
     let promptVersion = 0;
@@ -74,15 +77,19 @@ export default Plugin.define({
       const status = windowStatus([...families.values()].flatMap((family) => [...family.sessions.values()]));
       if (status === 'done' && (desired === undefined || [...families.values()].some((family) => family.snapshot))) return;
       if (pendingPrompt && !owner(pendingPrompt.sessionID)) pendingPrompt = undefined;
-      if (status === desired && status === reported && !(status === 'working' && pendingPrompt)) return;
+      if (status === desired && status === reported && (visibleRoot === undefined || reportedSession === visibleRoot) && !(status === 'working' && pendingPrompt)) return;
       desired = status;
       queue = queue.then(async () => {
         if (closed || !desired) return;
         const next = desired;
+        // Closing the route does not transfer background work to another
+        // conversation; retain its last known identity until a new root opens.
+        const sessionID = visibleRoot ?? reportedSession;
         const prompt = next === 'working' ? pendingPrompt : undefined;
-        if (next === reported && !prompt) return;
-        if (await workmux(['set-window-status', next], prompt?.text)) {
+        if (next === reported && reportedSession === sessionID && !prompt) return;
+        if (await workmux(['set-window-status', next], prompt?.text, sessionID)) {
           reported = next;
+          reportedSession = sessionID;
           if (pendingPrompt === prompt) pendingPrompt = undefined;
         }
       });

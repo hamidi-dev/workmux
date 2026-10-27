@@ -1103,6 +1103,13 @@ mod tests {
         let legacy: RpcRequest =
             serde_json::from_str(r#"{"type":"SetStatus","status":"working"}"#).unwrap();
         assert!(matches!(legacy, RpcRequest::SetStatus { prompt: None, .. }));
+        assert!(matches!(
+            legacy,
+            RpcRequest::SetStatus {
+                session_id: None,
+                ..
+            }
+        ));
 
         let req = RpcRequest::SetStatus {
             status: "working".to_string(),
@@ -1114,6 +1121,10 @@ mod tests {
         assert!(matches!(
             parsed,
             RpcRequest::SetStatus { prompt: Some(ref prompt), .. } if prompt == "fix the bug"
+        ));
+        assert!(matches!(
+            parsed,
+            RpcRequest::SetStatus { session_id: Some(ref session_id), .. } if session_id == "root-session"
         ));
         assert_eq!(req.kind(), "SetStatus");
     }

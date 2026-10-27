@@ -9,6 +9,7 @@ async function createHarness({
   const statuses: string[] = [];
   const commands: string[] = [];
   const prompts: Array<{ status: string; prompt: string }> = [];
+  const payloads: Array<{ prompt?: string; session_id?: string }> = [];
   const lookups: string[] = [];
   const shell = (strings: TemplateStringsArray, ...values: unknown[]) => {
     const status = values[0] as string | undefined;
@@ -28,7 +29,9 @@ async function createHarness({
           statuses.push(status!);
         }
         if (stdin && status !== undefined) {
-          prompts.push({ status, prompt: JSON.parse(await stdin.text()).prompt });
+          const payload = JSON.parse(await stdin.text());
+          payloads.push(payload);
+          prompts.push({ status, prompt: payload.prompt });
         }
       },
     };
@@ -49,6 +52,7 @@ async function createHarness({
     commands,
     statuses,
     prompts,
+    payloads,
     lookups,
     emit: async (event: unknown) => {
       await hooks.event?.({ event } as never);
@@ -399,6 +403,8 @@ describe('WorkmuxStatusPlugin', () => {
 
     expect(harness.statuses).toEqual(['working', 'done']);
     expect(harness.prompts).toEqual([{ status: 'working', prompt: 'fix the\nbug' }]);
+    expect(harness.payloads).toEqual([{ prompt: 'fix the\nbug', session_id: 'parent' }]);
+    expect(harness.commands).toContain('workmux set-window-status working < <stdin>');
   });
 
   test('sends a prompt queued while working without a status change', async () => {
@@ -410,6 +416,7 @@ describe('WorkmuxStatusPlugin', () => {
 
     expect(harness.statuses).toEqual(['working', 'working']);
     expect(harness.prompts).toEqual([{ status: 'working', prompt: 'also update docs' }]);
+    expect(harness.payloads).toEqual([{ prompt: 'also update docs', session_id: 'parent' }]);
   });
 
   test('holds a prompt while waiting until work resumes', async () => {

@@ -99,6 +99,7 @@ async function hydrationHarness(options: {
   pendingSession?: string;
   forms?: string[];
   client?: ReturnType<typeof snapshotClient>;
+  viewedSession?: () => string;
 } = {}) {
   process.env.TMUX = 'test-tmux';
   process.env.TMUX_PANE = '%123';
@@ -122,7 +123,7 @@ async function hydrationHarness(options: {
         form: { sync: async () => {}, list: () => (options.forms ?? []).map((id) => ({ id })) },
       },
     },
-    ui: { router: { current: () => open ? { type: 'session', sessionID: 'ours' } : { type: 'home' } } },
+    ui: { router: { current: () => open ? { type: 'session', sessionID: options.viewedSession?.() ?? 'ours' } : { type: 'home' } } },
   } as any);
   return {
     close: () => { open = false; },
@@ -826,24 +827,52 @@ test('resolves a viewed session ancestry without creating duplicate ownership', 
 });
 
 async function promptInput() {
-  return readFile(`${process.env.WORKMUX_TEST_LOG}.stdin`, 'utf8').catch(() => '');
+  return (await hookInput()).filter((payload) => payload.prompt !== undefined);
+}
+
+async function hookInput(): Promise<Array<{ prompt?: string; session_id?: string }>> {
+  const raw = await readFile(`${process.env.WORKMUX_TEST_LOG}.stdin`, 'utf8').catch(() => '');
+  return raw.trim() ? raw.trim().split('\n').map((line) => JSON.parse(line)) : [];
 }
 
 function userPrompt(sessionID: string, text: string) {
   return { sessionID, item: { type: 'user', payload: { text }, delivery: 'steer' } };
 }
 
+test('switching conversations updates the root identity even when both are working', async () => {
+  let viewed = 'ours';
+  const harness = await hydrationHarness({
+    root: (id) => id,
+    viewedSession: () => viewed,
+    client: snapshotClient({ active: async () => ({ ours: { type: 'running' }, second: { type: 'running' } }) }),
+  });
+  try {
+    await waitForCalls(2);
+    expect(await hookInput()).toEqual([{ session_id: 'ours' }]);
+    viewed = 'second';
+    harness.emit('session.execution.started', { sessionID: 'second' });
+    await waitForCalls(3);
+    expect((await hookInput()).at(-1)).toEqual({ session_id: 'second' });
+    expect((await calls()).at(-1)).toBe('%123|set-window-status working');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('top-level prompts reach workmux stdin, including another prompt while working', async () => {
   const harness = await hydrationHarness({ get: () => ({ id: 'ours' }) });
   try {
     await waitForCalls(2);
+    expect(await hookInput()).toEqual([{ session_id: 'ours' }]);
     harness.emit('session.inbox.enqueued', userPrompt('ours', 'fix the bug\nwith details'));
     await waitForCalls(3);
-    expect(await promptInput()).toBe(JSON.stringify({ prompt: 'fix the bug\nwith details' }));
+    expect(await promptInput()).toEqual([{ prompt: 'fix the bug\nwith details', session_id: 'ours' }]);
     harness.emit('session.inbox.enqueued', userPrompt('ours', 'also add tests'));
     await waitForCalls(4);
-    expect(await promptInput()).toBe(JSON.stringify({ prompt: 'fix the bug\nwith details' })
-      + JSON.stringify({ prompt: 'also add tests' }));
+    expect(await promptInput()).toEqual([
+      { prompt: 'fix the bug\nwith details', session_id: 'ours' },
+      { prompt: 'also add tests', session_id: 'ours' },
+    ]);
     expect((await calls()).slice(2)).toEqual([
       '%123|set-window-status working', '%123|set-window-status working',
     ]);
@@ -866,7 +895,7 @@ test('prompts exclude children, synthetic messages, blank text, and unrelated se
     harness.emit('session.inbox.enqueued', { sessionID: 'ours', item: { type: 'synthetic', payload: { text: 'internal notification' } } });
     harness.emit('session.inbox.enqueued', userPrompt('ours', 'real prompt'));
     await waitForCalls(3);
-    expect(await promptInput()).toBe(JSON.stringify({ prompt: 'real prompt' }));
+    expect(await promptInput()).toEqual([{ prompt: 'real prompt', session_id: 'ours' }]);
     expect(await calls()).toHaveLength(3);
   } finally {
     await harness.cleanup();
@@ -884,7 +913,7 @@ test('a prompt received before execution waits for the working report', async ()
     harness.emit('session.inbox.enqueued', userPrompt('ours', 'new turn'));
     harness.emit('session.execution.started', { sessionID: 'ours' });
     await waitForCalls(3);
-    expect(await promptInput()).toBe(JSON.stringify({ prompt: 'new turn' }));
+    expect(await promptInput()).toEqual([{ prompt: 'new turn', session_id: 'ours' }]);
   } finally {
     await harness.cleanup();
   }
@@ -908,7 +937,7 @@ test('missing metadata is checked before capturing a prompt without letting a ch
     harness.emit('session.inbox.enqueued', userPrompt('child', 'child prompt'));
     metadata.resolve();
     await waitForCalls(3);
-    expect(await promptInput()).toBe(JSON.stringify({ prompt: 'top-level prompt' }));
+    expect(await promptInput()).toEqual([{ prompt: 'top-level prompt', session_id: 'ours' }]);
   } finally {
     metadata.resolve();
     await harness.cleanup();

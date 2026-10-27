@@ -499,6 +499,63 @@ def test_set_window_status_accepts_explicit_tmux_target(
 
 
 @pytest.mark.tmux_only
+@pytest.mark.parametrize("explicit_session", [False, True])
+def test_session_identity_coexists_with_prompt_capture(
+    mux_server: TmuxEnvironment,
+    workmux_exe_path: Path,
+    mux_repo_path: Path,
+    explicit_session: bool,
+):
+    """JSON carries both fields; an explicit ID must never wait for stdin EOF."""
+    env = mux_server
+    write_workmux_config(mux_repo_path, panes=[{"focus": True}])
+    with (mux_repo_path / ".workmux.yaml").open("a") as config:
+        config.write("\ndashboard:\n  agent_columns: [prompt]\n")
+    pane_id = env.tmux(["display-message", "-p", "#{pane_id}"]).stdout.strip()
+    target_env = {
+        **env.env,
+        "WORKMUX_STATUS_BACKEND": "tmux",
+        "WORKMUX_STATUS_INSTANCE": str(env.socket_path),
+        "WORKMUX_STATUS_PANE_ID": pane_id,
+    }
+    args = [str(workmux_exe_path), "set-window-status", "working"]
+    if explicit_session:
+        args.extend(["--session-id", "ses_exact_root"])
+        with subprocess.Popen(
+            args,
+            cwd=mux_repo_path,
+            env=target_env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as child:
+            try:
+                # Keep the parent's pipe open: reading stdin here would hang.
+                assert child.wait(timeout=5) == 0
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+    else:
+        subprocess.run(
+            args,
+            cwd=mux_repo_path,
+            env=target_env,
+            input=json.dumps(
+                {"session_id": "ses_exact_root", "prompt": "fix\nthe bug"}
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=5,
+        )
+    state = read_agent_state(list_agent_state_files(env)[0])
+    assert state["agent_session_id"] == "ses_exact_root"
+    assert state["status"] == "working"
+    assert state.get("prompt") == (None if explicit_session else "fix the bug")
+
+
+@pytest.mark.tmux_only
 def test_set_window_status_clear_clears_explicit_target_state(
     mux_server: TmuxEnvironment, workmux_exe_path: Path, mux_repo_path: Path
 ):
